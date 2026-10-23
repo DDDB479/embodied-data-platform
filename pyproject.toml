@@ -24,6 +24,11 @@ all = ["pyarrow>=14", "h5py>=3.9", "mcap>=1.1"]
 embodied = "embodied_core.cli:main"
 embodied-mcp = "embodied_core.mcp_server:main"
 
+[project.urls]
+Homepage = "https://github.com/DDDB479/embodied-data-platform"
+Repository = "https://github.com/DDDB479/embodied-data-platform"
+Issues = "https://github.com/DDDB479/embodied-data-platform/issues"
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 

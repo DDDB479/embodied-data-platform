@@ -28,6 +28,11 @@
     "data-quality"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DDDB479/embodied-data-platform.git"
+  },
+  "homepage": "https://github.com/DDDB479/embodied-data-platform#readme",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
