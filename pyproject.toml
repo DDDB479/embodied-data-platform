@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embodied-core"
+version = "0.1.0"
+description = "Format-aware toolkit for embodied-AI robotics datasets: detect, validate, QC, catalog, convert, scaffold."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Embodied Data Studio" }]
+keywords = ["embodied-ai", "robotics", "dataset", "lerobot", "mcap", "rosbag", "hdf5", "mcp", "dsh"]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# Optional accelerators. The core degrades gracefully when they are absent.
+parquet = ["pyarrow>=14"]
+hdf5 = ["h5py>=3.9"]
+mcap = ["mcap>=1.1"]
+all = ["pyarrow>=14", "h5py>=3.9", "mcap>=1.1"]
+
+[project.scripts]
+embodied = "embodied_core.cli:main"
+embodied-mcp = "embodied_core.mcp_server:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

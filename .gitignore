@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Node
+node_modules/
+
+# Local development support: generated fixtures, offline wheels and the vendored
+# dependency tree used on machines where `pip install` is unavailable.
+# The generator scripts themselves live in tools/ and are tracked.
+.devtools/
+
+# Catalogs and generated datasets
+*.db
+*.sqlite
+
+# Never commit credentials (push helper reads this file, then deletes it)
+.git-token.local
+.env
+.env.local
+
+
+# Local run logs
+*.log

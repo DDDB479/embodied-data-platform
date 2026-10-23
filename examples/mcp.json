@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "embodied-data": {
+      "command": "embodied-mcp",
+      "args": [],
+      "env": {
+        "PYTHONPATH": "D:/具身平台插件开发/src"
+      }
+    }
+  }
+}

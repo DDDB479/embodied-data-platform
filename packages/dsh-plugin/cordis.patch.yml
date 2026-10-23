@@ -1,0 +1,27 @@
+# Patch layer contributed by the dsh-embodied-data plugin package.
+#
+# A bundle patch is a loader patch list. This one inserts a single row: the MCP
+# bridge between DSH tools and the bundled Python `embodied_core` server.
+#
+# Override any key from the profile's own cordis.patch.yml by targeting `id`.
+- insert:
+    - id: dsh-embodied-data
+      name: dsh-embodied-data
+      config:
+        # Inject the "Embodied data toolbox" system-prompt section.
+        promptPolicy: true
+        # Absolute interpreter path. Empty = auto-detect (EMBODIED_PYTHON,
+        # DSH_PYTHON, PYTHON, then python/python3 on PATH).
+        python: ''
+        # Python import roots. Empty = auto-detect from the package layout
+        # (src/, .deps/, vendor/) so offline installs keep working.
+        pythonPath: []
+        # Tool name prefix; keeps embodied_* grouped and collision-free.
+        prefix: embodied_
+        # Per-call budget for a tool invocation.
+        timeoutMs: 120000
+        # Restart the Python server after an unexpected exit.
+        restart: true
+        # Empty includeTools = publish every tool the server advertises.
+        includeTools: []
+        excludeTools: []

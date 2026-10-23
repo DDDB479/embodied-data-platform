@@ -1,0 +1,8 @@
+# Codex CLI: append to ~/.codex/config.toml (or run `codex mcp add embodied -- embodied-mcp`).
+[mcp_servers.embodied-data]
+command = "embodied-mcp"
+args = []
+# Uncomment when the server is not installed as a console script:
+# command = "/abs/path/to/python"
+# args = ["-m", "embodied_core.mcp_server"]
+# env = { PYTHONPATH = "D:/具身平台插件开发/src" }

@@ -1,0 +1,710 @@
+"""Project scaffolding.
+
+``scaffold`` writes ready-to-run skeletons so a new data platform starts from a
+working layout instead of an empty directory:
+
+* ``platform`` — a small Python service package: HTTP API, adapter registry,
+  quality gate, catalog, tests and a documented data contract.
+* ``adapter``  — a new format adapter implementing the ``detect``/``load``/
+  ``frames`` protocol, plus a fixture-driven test.
+* ``pipeline`` — an ingest pipeline: discover → validate → quality → export,
+  wired to the library's own functions.
+
+Every generated project is dependency-light on purpose: it runs with the same
+interpreter as the toolkit and only reaches for extra packages where noted.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Iterable
+
+from . import __version__
+
+
+def write_text(path: Path, content: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8", newline="\n")
+    return path
+
+
+def write_json(path: Path, payload: Any) -> Path:
+    return write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def write_jsonl(path: Path, rows: Iterable[Any]) -> Path:
+    return write_text(path, "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+
+
+def slugify(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in name.strip()).strip("_")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return (cleaned or "dataset_platform").lower()
+
+
+# --------------------------------------------------------------------------
+# shared documents
+# --------------------------------------------------------------------------
+DATA_CONTRACT = """# Embodied data contract
+
+This document is the interface between data collection and training. Keep it
+short, versioned, and enforced by `embodied validate`.
+
+## 1. Storage layout
+
+One directory per dataset version, immutable once published:
+
+```
+datasets/<dataset_id>/<version>/
+  meta/info.json            # required: codebase_version, fps, robot_type, features
+  meta/tasks.jsonl          # instruction strings, one per line
+  meta/episodes.jsonl       # per-episode length and task
+  data/chunk-000/...        # numeric frames (parquet)
+  videos/...                # camera streams (mp4), optional
+```
+
+## 2. Frame contract
+
+| column | type | meaning |
+| --- | --- | --- |
+| `observation.state` | float32[d] | joint positions / end-effector pose at capture time |
+| `action` | float32[a] | command sent to the robot at this timestep |
+| `timestamp` | float32 | seconds from episode start, `frame_index / fps` |
+| `frame_index` | int64 | 0-based frame number inside the episode |
+| `episode_index` | int64 | stable episode id, never reused |
+| `task_index` | int64 | index into `meta/tasks.jsonl` |
+
+Rules:
+
+1. `fps` is constant per dataset; resampling happens before writing.
+2. `action[t]` is the command that produced `state[t+1]`. Document any other
+   convention (`delta` vs `absolute`) in `meta/info.json`.
+3. No NaN/Inf in state or action. Short gaps are interpolated; long gaps mark
+   the episode invalid and it is dropped.
+4. Feature names are lowercase snake_case and stable across versions. Renaming
+   a feature is a breaking change: bump the major version.
+5. `episode_index` never changes once published; deletions leave a gap and are
+   recorded in `meta/removals.jsonl`.
+
+## 3. Units and frames
+
+- Joint positions in radians, prismatic joints in metres, poses in metres and
+  quaternions (xyzw).
+- Robot base frame is the dataset frame; the world frame must be declared in
+  `meta/info.json` as `world_frame` when used.
+- Camera intrinsics/extrinsics live in `meta/calibration.json`, keyed by camera
+  name, with the capture timestamp.
+
+## 4. Quality gates before publish
+
+Run `embodied validate <path> --include-frames` and require:
+
+- zero `error` issues;
+- health score >= 80;
+- no episode shorter than 10 frames;
+- every episode has a task string;
+- at least 10 episodes per task before training on it.
+
+## 5. Versioning
+
+`<dataset_id>/<major>.<minor>` — major for breaking schema changes, minor for
+added episodes or metadata. The catalog stores the resolved path and checksum.
+"""
+
+
+def _pyproject(package: str, distribution: str) -> str:
+    return f"""[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "{distribution}"
+version = "0.1.0"
+description = "Embodied-AI data platform skeleton"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=14"]
+hdf5 = ["h5py>=3.9"]
+all = ["pyarrow>=14", "h5py>=3.9", "mcap>=1.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["{package}*"]
+"""
+
+
+PLATFORM_README = """# {name}
+
+An embodied-AI data platform skeleton, generated by `embodied scaffold`
+(toolkit {version}). It answers four questions:
+
+1. **What is in this dataset?** — `{package}.api` exposes summary/validation over HTTP.
+2. **Is it usable?** — `{package}.quality` gates publish on structural and numeric checks.
+3. **What do we have across datasets?** — `{package}.catalog` keeps a SQLite index.
+4. **How do we extend it?** — `{package}.adapters` is a registry; add a module per format.
+
+## Quick start
+
+```bash
+python -m {package}.api --port 8000            # HTTP API
+python -m {package}.ingest ../datasets          # scan + validate + index
+embodied validate ../datasets/my_task/v1        # single dataset
+```
+
+## Layout
+
+```
+src/{package}/
+  api.py          stdlib HTTP server: /health /datasets /validate /catalog
+  adapters.py     format registry (wraps embodied_core.registry)
+  quality.py      publish gates and anomaly scan
+  catalog.py      SQLite index and search
+  ingest.py       discover -> validate -> index pipeline
+docs/data-contract.md
+tests/test_contract.py
+```
+
+## Data contract
+
+See `docs/data-contract.md`. It is enforced by `quality.publish_gate`.
+
+## Next steps
+
+- [ ] Point `DATASETS_ROOT` at your storage mount.
+- [ ] Add authentication in front of `api.py` before exposing it.
+- [ ] Add a camera adapter: videos are referenced, not copied.
+- [ ] Wire `ingest.py` into CI so invalid datasets never publish.
+"""
+
+
+API_TEMPLATE = '''"""HTTP API for the {name} data platform (standard library only)."""
+
+from __future__ import annotations
+
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from embodied_core import describe_formats, open_dataset
+from embodied_core.catalog import index, search, stats
+from embodied_core.quality import compute_feature_stats, detect_anomalies
+from embodied_core.validate import validate
+
+DATASETS_ROOT = Path(os.environ.get("DATASETS_ROOT", ".")).expanduser()
+CATALOG_DB = Path(os.environ.get("CATALOG_DB", "catalog.db")).expanduser()
+
+
+def _summary(path: Path) -> dict:
+    dataset = open_dataset(path)
+    try:
+        return dataset.summary.to_dict(include_episodes=False)
+    finally:
+        dataset.close()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "{package}/0.1.0"
+
+    def _send(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _path_param(self, query: dict, key: str = "path") -> Path | None:
+        value = (query.get(key) or [None])[0]
+        if not value:
+            return None
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = DATASETS_ROOT / candidate
+        try:
+            candidate.resolve().relative_to(DATASETS_ROOT.resolve())
+        except ValueError:
+            return None
+        return candidate
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server API
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        try:
+            if parsed.path == "/health":
+                self._send(200, {{"ok": True, "root": str(DATASETS_ROOT)}})
+            elif parsed.path == "/formats":
+                self._send(200, {{"formats": describe_formats()}})
+            elif parsed.path == "/datasets":
+                target = self._path_param(query)
+                if target is None:
+                    self._send(400, {{"error": "path query parameter required"}})
+                    return
+                self._send(200, _summary(target))
+            elif parsed.path == "/validate":
+                target = self._path_param(query)
+                if target is None:
+                    self._send(400, {{"error": "path query parameter required"}})
+                    return
+                self._send(200, validate(target, include_frames=query.get("frames", ["0"])[0] == "1"))
+            elif parsed.path == "/quality":
+                target = self._path_param(query)
+                if target is None:
+                    self._send(400, {{"error": "path query parameter required"}})
+                    return
+                dataset = open_dataset(target)
+                try:
+                    ids, columns = dataset.frames()
+                    self._send(
+                        200,
+                        {{
+                            "stats": compute_feature_stats(columns),
+                            "anomalies": detect_anomalies(ids, columns, fps=dataset.summary.fps),
+                        }},
+                    )
+                finally:
+                    dataset.close()
+            elif parsed.path == "/catalog":
+                self._send(200, stats(CATALOG_DB))
+            elif parsed.path == "/catalog/search":
+                self._send(200, {{"results": search(CATALOG_DB, text=(query.get("q") or [None])[0], limit=int((query.get("limit") or ["20"])[0]))}})
+            else:
+                self._send(404, {{"error": "not found", "routes": ["/health", "/formats", "/datasets", "/validate", "/quality", "/catalog", "/catalog/search"]}})
+        except FileNotFoundError as exc:
+            self._send(404, {{"error": f"not found: {{exc}}"}})
+        except Exception as exc:  # report, do not crash the server
+            self._send(500, {{"error": f"{{type(exc).__name__}}: {{exc}}"}})
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/catalog/index":
+            try:
+                self._send(200, index(DATASETS_ROOT, CATALOG_DB))
+            except Exception as exc:
+                self._send(500, {{"error": f"{{type(exc).__name__}}: {{exc}}"}})
+            return
+        self._send(404, {{"error": "not found"}})
+
+    def log_message(self, fmt: str, *args) -> None:  # quieter logs
+        print(f"[{{self.address_string()}}] {{fmt % args}}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="{name} API")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args(argv)
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"serving {{DATASETS_ROOT}} on http://{{args.host}}:{{args.port}}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+QUALITY_TEMPLATE = '''"""Publish gates for {name}.
+
+Structural checks come from embodied_core.validate; this module adds the
+policy decisions: what score is acceptable, which anomalies block a publish,
+and what the release record looks like.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from embodied_core.quality import compute_feature_stats, detect_anomalies
+from embodied_core.validate import validate
+
+MIN_SCORE = 80
+MIN_EPISODE_FRAMES = 10
+MAX_ERROR_RATE = 0.0
+
+
+def publish_gate(path: str, *, min_score: int = MIN_SCORE) -> dict[str, Any]:
+    """Return {{"publish": bool, "reasons": [...], "report": {...}}}}."""
+    report = validate(path, include_frames=True, checks=None)
+    reasons: list[str] = []
+    if report["errors"] > MAX_ERROR_RATE:
+        reasons.append(f"{{report['errors']}} error-level issues")
+    if report["score"] < min_score:
+        reasons.append(f"health score {{report['score']}} < {{min_score}}")
+    short = [
+        issue["episode"]
+        for issue in report["issues"]
+        if issue["code"] == "episode.zero_length"
+    ]
+    if short:
+        reasons.append(f"{{len(short)}} zero-length episodes")
+    return {{"publish": not reasons, "reasons": reasons, "report": report}}
+
+
+def anomaly_report(path: str, *, limit: int = 50) -> dict[str, Any]:
+    from embodied_core import open_dataset
+
+    dataset = open_dataset(path)
+    try:
+        ids, columns = dataset.frames()
+        anomalies = detect_anomalies(ids, columns, fps=dataset.summary.fps)[:limit]
+        return {{
+            "stats": compute_feature_stats(columns),
+            "anomalies": anomalies,
+            "counts": {{severity: sum(1 for a in anomalies if a["severity"] == severity) for severity in ("error", "warn", "info")}},
+        }}
+    finally:
+        dataset.close()
+'''
+
+
+ADAPTERS_TEMPLATE = '''"""Format registry extension point for {name}.
+
+The toolkit already detects LeRobot, HDF5, MCAP, rosbag1/2, RLDS and the
+canonical JSONL layout. Register a custom adapter here when your platform has
+its own on-disk layout.
+
+An adapter is a module with two functions:
+
+    def detect(root: Path) -> Detection | None
+    def load(root: Path, detection: Detection | None) -> DatasetObject
+
+and a ``DatasetObject`` subclass implementing ``frames(episodes, features) ->
+(episode_ids, columns)`` when the format is tabular.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from embodied_core.formats.base import DatasetObject, Detection, guess_kind
+from embodied_core.model import DatasetSummary, FeatureSpec
+
+CUSTOM: dict[str, Any] = {{}}
+
+
+def register(name: str, module: Any) -> None:
+    CUSTOM[name] = module
+
+
+class ExampleDataset(DatasetObject):
+    """Replace this with a real reader; keep the constructor contract."""
+
+    def __init__(self, root: Path, summary: DatasetSummary) -> None:
+        super().__init__(root, summary, capabilities={{"frames", "episodes"}})
+
+    def frames(self, episodes=None, features=None):
+        # TODO: read your files and return (episode_ids, {{feature: 2-D float array}})
+        ids = list(range(len(self.summary.episodes)))
+        columns = {{feature.key: np.zeros((len(ids), max(feature.dim, 1))) for feature in self.summary.features}}
+        return ids, columns
+
+
+def detect(root: Path) -> Detection | None:
+    if not root.is_dir() or not (root / "MY_FORMAT.json").is_file():
+        return None
+    return Detection("my-format", version="1", confidence=0.9, evidence=["MY_FORMAT.json present"])
+
+
+def load(root: Path, detection: Detection | None = None) -> ExampleDataset:
+    features = [FeatureSpec(key="observation.state", dtype="float32", shape=(7,), kind=guess_kind("observation.state"))]
+    summary = DatasetSummary(path=str(root), format="my-format", features=features)
+    return ExampleDataset(root, summary)
+'''
+
+
+INGEST_TEMPLATE = '''"""Ingest pipeline: discover -> validate -> quality gate -> catalog."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from embodied_core.catalog import index, stats
+from embodied_core.quality import compute_feature_stats, detect_anomalies
+from embodied_core.registry import detect_dataset, open_dataset
+from embodied_core.validate import validate
+
+
+def process(path: Path, *, db: Path, dry_run: bool) -> dict:
+    report = validate(path, include_frames=True)
+    entry = {{
+        "path": str(path),
+        "format": report.get("format"),
+        "score": report.get("score"),
+        "errors": report.get("errors"),
+        "warnings": report.get("warnings"),
+        "publishable": report.get("score", 0) >= 80 and report.get("errors", 1) == 0,
+    }}
+    if entry["publishable"] and not dry_run:
+        try:
+            dataset = open_dataset(path)
+            try:
+                ids, columns = dataset.frames()
+                entry["anomalies"] = len(detect_anomalies(ids, columns, fps=dataset.summary.fps))
+                entry["stats"] = {{k: v.get("mean") for k, v in compute_feature_stats(columns).items()}}
+            finally:
+                dataset.close()
+        except Exception as exc:
+            entry["analysis_error"] = f"{{type(exc).__name__}}: {{exc}}"
+    return entry
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Ingest datasets into the catalog")
+    parser.add_argument("root", nargs="?", default=".", help="directory to scan")
+    parser.add_argument("--db", default="catalog.db")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).expanduser()
+    if not root.exists():
+        print(f"no such path: {{root}}", file=sys.stderr)
+        return 2
+    targets = [root] if root.is_file() else sorted(p for p in root.iterdir() if p.is_dir())
+    results = []
+    failures = 0
+    for target in targets:
+        try:
+            detect_dataset(target)
+        except Exception:
+            continue  # not a dataset
+        entry = process(target, db=Path(args.db), dry_run=args.dry_run)
+        results.append(entry)
+        if not entry["publishable"]:
+            failures += 1
+
+    if not args.dry_run and results:
+        index(root, args.db, validate=True)
+    body = {{
+        "root": str(root),
+        "checked": len(results),
+        "publishable": sum(1 for r in results if r["publishable"]),
+        "rejected": failures,
+        "results": results,
+        "catalog": None if args.dry_run else stats(args.db),
+    }}
+    if args.json:
+        print(json.dumps(body, indent=2, ensure_ascii=False))
+    else:
+        print(f"{{body['checked']}} datasets: {{body['publishable']}} publishable, {{failures}} rejected")
+        for entry in results:
+            flag = "ok  " if entry["publishable"] else "FAIL"
+            print(f"  [{{flag}}] score={{entry['score']:<3}} {{entry['path']}} ({{entry['format']}})")
+    return 0 if failures == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+TEST_TEMPLATE = '''"""Contract tests for {name}: run with `python -m pytest -q`."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from embodied_core import open_dataset
+from embodied_core.registry import detect_dataset
+
+
+def make_fixture(root: Path) -> Path:
+    """A 3-episode canonical dataset, written without optional dependencies."""
+    dataset = root / "fixture"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text(
+        json.dumps({{"format": "embodied-jsonl", "fps": 10, "robot_type": "sim", "features": {{}}}}),
+        encoding="utf-8",
+    )
+    lines = []
+    for episode in range(3):
+        frames = [
+            {{"observation.state": [0.1 * i, 0.2 * i], "action": [0.05 * i, 0.05 * i]}}
+            for i in range(20)
+        ]
+        lines.append(json.dumps({{"episode_index": episode, "task": "reach", "frames": frames}}))
+    (dataset / "episodes.jsonl").write_text("\\n".join(lines) + "\\n", encoding="utf-8")
+    return dataset
+
+
+def test_detects_canonical_jsonl(tmp_path: Path) -> None:
+    dataset = make_fixture(tmp_path)
+    detection = detect_dataset(dataset)
+    assert detection.format == "embodied-jsonl"
+
+
+def test_frames_are_two_dimensional(tmp_path: Path) -> None:
+    dataset = make_fixture(tmp_path)
+    with open_dataset(dataset) as handle:
+        ids, columns = handle.frames()
+    assert len(ids) == 60
+    assert columns["action"].shape == (60, 2)
+
+
+def test_validation_is_clean(tmp_path: Path) -> None:
+    from embodied_core.validate import validate
+
+    dataset = make_fixture(tmp_path)
+    report = validate(dataset)
+    assert report["errors"] == 0
+    assert report["score"] >= 90
+'''
+
+
+
+ADAPTER_TEST_TEMPLATE = '''"""Tests for the new adapter: replace the fixture with a real sample."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from embodied_core.formats.base import DatasetObject
+
+import my_adapter
+
+
+def test_detect_returns_none_for_unrelated_path(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("nothing here", encoding="utf-8")
+    assert my_adapter.detect(tmp_path) is None
+
+
+def test_load_builds_a_summary(tmp_path: Path) -> None:
+    (tmp_path / "MY_FORMAT.json").write_text("{}", encoding="utf-8")
+    dataset = my_adapter.load(tmp_path)
+    assert isinstance(dataset, DatasetObject)
+    assert dataset.summary.format == "my-format"
+'''
+
+
+PIPELINE_TEST_TEMPLATE = '''"""Tests for the ingest pipeline."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from src.ingest import process
+
+
+def test_process_reports_scores(tmp_path: Path) -> None:
+    dataset = tmp_path / "ds"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text(json.dumps({{"format": "embodied-jsonl", "fps": 30}}), encoding="utf-8")
+    (dataset / "episodes.jsonl").write_text(
+        json.dumps({{"episode_index": 0, "task": "pick", "frames": [{{"action": [0.0], "observation.state": [0.0]}}] * 12}}) + "\\n",
+        encoding="utf-8",
+    )
+    entry = process(dataset, db=tmp_path / "catalog.db", dry_run=True)
+    assert entry["format"] == "embodied-jsonl"
+    assert entry["score"] is not None
+'''
+
+
+# --------------------------------------------------------------------------
+# public entry point
+# --------------------------------------------------------------------------
+def _render(template: str, **values: str) -> str:
+    """Substitute ``{key}`` placeholders without touching any other brace.
+
+    Templates are mostly Python source, so ``str.format`` cannot be used: dict
+    literals, f-strings and docstring examples all contain braces that must
+    survive verbatim. Doubled braces (``{{``/``}}``) are treated as escapes, so
+    the same templates work whether they were authored for ``.format`` or not.
+    """
+    out = template.replace("{{", "\x00").replace("}}", "\x01")
+    for key, value in values.items():
+        out = out.replace("{" + key + "}", str(value))
+    return out.replace("\x00", "{").replace("\x01", "}")
+
+
+def scaffold(
+    destination: str | Path,
+    *,
+    kind: str = "platform",
+    name: str = "embodied-platform",
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Write a project skeleton and return the list of files created."""
+    dest = Path(destination).expanduser()
+    if dest.exists() and any(dest.iterdir()) and not overwrite:
+        raise FileExistsError(f"{dest} is not empty; pass overwrite=True")
+    dest.mkdir(parents=True, exist_ok=True)
+    package = slugify(name)
+    written: list[Path] = []
+    meta = {"toolkit": __version__, "name": name, "package": package, "kind": kind}
+
+    if kind == "platform":
+        base = dest / "src" / package
+        written.append(write_text(dest / "pyproject.toml", _pyproject(package, name)))
+        written.append(write_text(dest / "README.md", _render(PLATFORM_README, name=name, package=package, version=__version__)))
+        written.append(write_text(dest / "docs" / "data-contract.md", DATA_CONTRACT))
+        written.append(write_text(base / "__init__.py", f'"""{name} data platform."""\n\n__version__ = "0.1.0"\n'))
+        written.append(write_text(base / "api.py", _render(API_TEMPLATE, name=name, package=package)))
+        written.append(write_text(base / "quality.py", _render(QUALITY_TEMPLATE, name=name)))
+        written.append(write_text(base / "adapters.py", _render(ADAPTERS_TEMPLATE, name=name)))
+        written.append(write_text(base / "ingest.py", _render(INGEST_TEMPLATE)))
+        written.append(write_text(base / "catalog.py", '"""Catalog facade: see embodied_core.catalog."""\n\nfrom embodied_core.catalog import export_manifest, index, remove, search, stats\n\n__all__ = ["index", "search", "stats", "remove", "export_manifest"]\n'))
+        written.append(write_text(dest / "tests" / "test_contract.py", _render(TEST_TEMPLATE, name=name)))
+        written.append(write_text(dest / ".gitignore", "__pycache__/\n*.pyc\n.catalog.db\ncatalog.db\n.venv/\ndist/\nbuild/\n"))
+        written.append(write_text(dest / ".env.example", "DATASETS_ROOT=/data/datasets\nCATALOG_DB=./catalog.db\n"))
+        written.append(write_json(dest / "scaffold.json", meta))
+        written.append(write_text(dest / "Makefile", "validate:\n\tembodied validate $(DATASET)\n\nindex:\n\tembodied catalog index $(DATASETS_ROOT) --db catalog.db\n\napi:\n\tpython -m %s.api --port 8000\n" % package))
+
+    elif kind == "adapter":
+        written.append(write_text(dest / "my_adapter.py", _render(ADAPTERS_TEMPLATE, name=name)))
+        written.append(write_text(dest / "test_my_adapter.py", _render(ADAPTER_TEST_TEMPLATE)))
+        written.append(write_text(dest / "README.md", f"# {name} adapter\n\nImplement `detect`/`load` in `my_adapter.py`, then register it in your platform's `adapters.py`.\n"))
+        written.append(write_json(dest / "scaffold.json", {**meta, "register": "from embodied_core.formats import base; adapters.register('my-format', my_adapter)"}))
+
+    elif kind == "pipeline":
+        written.append(write_text(dest / "src" / "ingest.py", _render(INGEST_TEMPLATE)))
+        written.append(write_text(dest / "src" / "__init__.py", ""))
+        written.append(write_text(dest / "tests" / "test_ingest.py", _render(PIPELINE_TEST_TEMPLATE)))
+        written.append(write_text(dest / "README.md", f"# {name}\n\nRun `python -m src.ingest --help`.\n"))
+        written.append(write_text(dest / "pyproject.toml", _pyproject("src", name)))
+        written.append(write_json(dest / "scaffold.json", meta))
+
+    else:
+        raise ValueError(f"unknown scaffold kind {kind!r}; supported: platform, adapter, pipeline")
+
+    return {
+        "kind": kind,
+        "destination": str(dest.resolve()),
+        "name": name,
+        "package": package,
+        "files": [str(p.relative_to(dest).as_posix()) for p in written],
+        "next_steps": {
+            "platform": [
+                f"pip install -e {dest}",
+                f"python -m {package}.api --port 8000",
+                f"embodied catalog index <datasets> --db catalog.db",
+            ],
+            "adapter": ["edit my_adapter.py", "python -m pytest -q"],
+            "pipeline": ["python -m src.ingest <datasets> --dry-run"],
+        }.get(kind, []),
+    }

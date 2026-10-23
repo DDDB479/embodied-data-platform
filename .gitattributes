@@ -1,0 +1,14 @@
+# Normalize line endings: the repo is edited on Windows and consumed on Linux
+# CI and inside containers, so the working tree uses LF everywhere.
+* text=auto eol=lf
+
+# Binary-ish assets must never be converted.
+*.whl binary
+*.png binary
+*.ico binary
+*.mp4 binary
+*.parquet binary
+*.hdf5 binary
+*.mcap binary
+*.db3 binary
+*.db binary
