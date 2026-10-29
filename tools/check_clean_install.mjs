@@ -62,7 +62,7 @@ function pickPackager() {
   fail('neither npm nor pnpm is available on PATH');
 }
 
-function packedTarball(stdout) {
+function packedTarball(stdout, packDir) {
   // pnpm writes lifecycle logs before the JSON document; try every object/array
   // boundary from the end so a leading `[dsh-embodied-data]` banner is harmless.
   const starts = [];
@@ -82,7 +82,7 @@ function packedTarball(stdout) {
   const entry = Array.isArray(parsed) ? parsed[0] : parsed;
   const filename = entry?.filename ?? entry?.tarball ?? entry?.path;
   if (!filename) throw new Error(`pack output has no filename: ${stdout.slice(0, 400)}`);
-  return path.resolve(PLUGIN_ROOT, filename);
+  return path.resolve(packDir, filename);
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -97,7 +97,7 @@ try {
   const packager = pickPackager();
   const pack = run(packager, ['pack', '--json', '--pack-destination', tmp], PLUGIN_ROOT);
   if (pack.status !== 0) fail(`${packager} pack failed`, `${pack.stdout}\n${pack.stderr}`);
-  tarball = packedTarball(pack.stdout);
+  tarball = packedTarball(pack.stdout, tmp);
   if (!fs.existsSync(tarball)) fail(`packed tarball missing: ${tarball}`);
 
   fs.mkdirSync(app, { recursive: true });

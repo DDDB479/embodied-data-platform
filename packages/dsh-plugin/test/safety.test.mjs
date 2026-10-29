@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  canonicalPath,
   isInsideWorkspace,
   normalizePathArguments,
   prepareToolCall,
@@ -75,7 +76,7 @@ test('in-workspace writes do not request approval', async () => {
   try {
     const ctx = ctxFor({ workspaceRoot: root, approval: () => 'allowed-once' });
     const args = await prepareToolCall({ ctx, tool: tool('convert_dataset', false), args: { source: 'in', destination: 'out' }, exec: { agent: { session: {} } }, config: config() });
-    assert.equal(args.destination, path.join(root, 'out'));
+    assert.equal(args.destination, canonicalPath(path.join(root, 'out')));
     assert.equal(ctx.calls.length, 0);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

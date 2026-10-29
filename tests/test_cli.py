@@ -103,6 +103,8 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(payload["windows"][0]["start_frame"], 0)
 
     def test_convert_command(self) -> None:
+        if not support.has_pyarrow():
+            self.skipTest("pyarrow not installed")
         target = self.root / "converted"
         code, output = _run("convert", str(self.dataset), str(target), "--target", "lerobot", "--json")
         if code == 3:

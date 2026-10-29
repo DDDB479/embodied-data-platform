@@ -21,6 +21,8 @@ class ConvertTestCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_jsonl_to_lerobot_round_trip(self) -> None:
+        if not support.has_pyarrow():
+            self.skipTest("pyarrow not installed")
         source = support.write_jsonl_dataset(self.root / "canonical")
         target = self.root / "converted"
         result = convert(source, target, target="lerobot")
@@ -48,6 +50,8 @@ class ConvertTestCase(unittest.TestCase):
         self.assertEqual(rebuilt.summary.total_frames, 60)
 
     def test_converted_dataset_passes_validation(self) -> None:
+        if not support.has_pyarrow():
+            self.skipTest("pyarrow not installed")
         source = support.write_jsonl_dataset(self.root / "canonical")
         target = self.root / "converted"
         result = convert(source, target, target="lerobot")

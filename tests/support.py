@@ -6,6 +6,7 @@ optional-dependency tests skip instead of failing).
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import sqlite3
 from pathlib import Path
@@ -13,6 +14,15 @@ from pathlib import Path
 import numpy as np
 
 FPS = 30.0
+
+
+def has_module(name: str) -> bool:
+    """True when an optional reader is importable in this environment."""
+    return importlib.util.find_spec(name) is not None
+
+
+def has_pyarrow() -> bool:
+    return has_module("pyarrow")
 
 
 def _episode_rows(index: int, length: int = 30, offset: float = 0.0, spikes: bool = False) -> list[dict]:
