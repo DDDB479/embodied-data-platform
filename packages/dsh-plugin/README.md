@@ -2,10 +2,13 @@
 
 DeepSeek Harness 插件：把 [embodied-data-studio](../../README.md) 的 13 个数据平台工具注册成原生 agent 工具，并注入使用它们的正确顺序。
 
-零依赖纯 ESM——不需要 `tsc`，不需要构建步骤，也不在 `node_modules` 里拉任何东西。JS 只做一件事：管理 `python -m embodied_core.mcp_server` 子进程并做 JSON-RPC 桥接。
+零依赖纯 ESM——不需要 `tsc`，不在 `node_modules` 里拉任何东西。JS 只做一件事：管理 `python -m embodied_core.mcp_server` 子进程并做 JSON-RPC 桥接。
+
+发布 tarball 会在 `prepack` 阶段自带 `python/embodied_core`，因此 `pnpm add dsh-embodied-data` 后不需要再找仓库源码；开发态 `link:` 安装仍直接使用仓库里的 `src/embodied_core`。
 
 ```bash
 node scripts/probe.mjs --python /path/to/python   # 自检，不需要启动 Harness
+node --test test/*.test.mjs                       # 路径、并发与审批单测
 ```
 
 安装、配置项、排查见 [docs/plugin.md](../../docs/plugin.md)。
@@ -32,6 +35,12 @@ node scripts/probe.mjs --python /path/to/python   # 自检，不需要启动 Har
 ## 输出约定
 
 每次调用返回 `{ tool, ok, data }`；`data` 是 MCP 工具的原始 JSON（超过 `maxOutputChars` 截断）。工具失败时 `ok=false`，`data` 里是 `{"error": {"code": "...", "message": "..."}}`。
+
+## 安全约定
+
+- 只有 `annotations.readOnlyHint: true` 的 MCP 工具声明为 `isConcurrencySafe`；写工具保持 DSH 默认串行。
+- `convert_dataset` / `scaffold_project` / `catalog_index` / 带 `out` 的 `labeling_tasks` 在工作区外写入前调用 `approval.request`，只接受 `allowed-once`。
+- 没有审批服务、审批被拒绝或 DSH 为只读模式时，写入不会发生。
 
 ## 文件
 

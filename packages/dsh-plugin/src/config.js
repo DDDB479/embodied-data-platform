@@ -57,6 +57,31 @@ export function findPythonRoot(start) {
 }
 
 /**
+ * Resolve the Python package root and keep track of where it came from. The
+ * source checkout, the `python/` directory inside a packed npm tarball and an
+ * explicit config value all need to be distinguishable in diagnostics.
+ */
+export function locatePythonRoot(pluginRoot, explicitRoot = '', extraPaths = []) {
+  if (explicitRoot && isPythonRoot(explicitRoot)) {
+    return { root: explicitRoot, source: 'config' };
+  }
+  const root = findPythonRoot(pluginRoot);
+  if (root) {
+    const bundled = path.resolve(pluginRoot, 'python');
+    const relative = path.relative(bundled, path.resolve(root));
+    const bundledMatch = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+    return { root, source: bundledMatch ? 'bundled' : 'checkout' };
+  }
+  // A pip/PYTHONPATH install is still usable when the caller points at the
+  // directory that contains `embodied_core` (for example site-packages).
+  for (const candidate of extraPaths) {
+    const resolved = path.resolve(pluginRoot, candidate);
+    if (isPythonRoot(resolved)) return { root: resolved, source: 'pythonPath' };
+  }
+  return { root: null, source: null };
+}
+
+/**
  * Import path entries for a Python root: the source tree plus an optional
  * vendored dependency directory (used by offline / sandboxed installs where
  * `pip install` is unavailable).
@@ -83,7 +108,10 @@ export function resolveConfig(raw, pluginRoot, options = {}) {
   const platform = options.platform ?? process.platform;
 
   const explicitRoot = typeof config.pythonRoot === 'string' && config.pythonRoot.trim() ? path.resolve(config.pythonRoot) : '';
-  const pythonRoot = explicitRoot && isPythonRoot(explicitRoot) ? explicitRoot : findPythonRoot(pluginRoot);
+  const configuredPaths = asStringArray(config.pythonPath).map((item) => path.resolve(pluginRoot, item));
+  const envPaths = String(env.PYTHONPATH ?? '').split(path.delimiter).filter(Boolean).map((item) => path.resolve(item));
+  const located = locatePythonRoot(pluginRoot, explicitRoot, [...configuredPaths, ...envPaths]);
+  const pythonRoot = located.root;
 
   const interpreter = typeof config.python === 'string' && config.python.trim() ? config.python.trim() : '';
   const candidates = [];
@@ -103,7 +131,7 @@ export function resolveConfig(raw, pluginRoot, options = {}) {
     /** Working directory for the child process (the Python root when known). */
     cwd: typeof config.cwd === 'string' && config.cwd ? config.cwd : pythonRoot ?? pluginRoot,
     /** Import path entries prepended to PYTHONPATH. */
-    pythonPath: [...new Set([...importPathFor(pythonRoot), ...asStringArray(config.pythonPath).map((p) => path.resolve(pluginRoot, p))])],
+    pythonPath: [...new Set([...importPathFor(pythonRoot), ...configuredPaths])],
     /** Extra environment variables for the child process. */
     env: config.env && typeof config.env === 'object' ? Object.fromEntries(Object.entries(config.env).map(([k, v]) => [k, String(v)])) : {},
     /** Tool name prefix; keeps the plugin's tools grouped and collision-free. */
@@ -123,6 +151,12 @@ export function resolveConfig(raw, pluginRoot, options = {}) {
     promptPolicy: config.promptPolicy !== false,
     /** Directory holding the Python package, or null when it cannot be found. */
     pythonRoot,
+    /** How `pythonRoot` was found: config | bundled | checkout | pythonPath | null. */
+    pythonRootSource: located.source,
+    /** Require an approval for write destinations outside the session workspace. */
+    confirmOutsideWorkspace: config.confirmOutsideWorkspace !== false,
+    /** Optional workspace root used before the DSH sandbox policy is available. */
+    workspaceRoot: typeof config.workspaceRoot === 'string' && config.workspaceRoot.trim() ? path.resolve(config.workspaceRoot) : null,
   };
 }
 
@@ -130,6 +164,7 @@ export function resolveConfig(raw, pluginRoot, options = {}) {
 export function describeConfig(config, extra = {}) {
   return {
     pythonRoot: config.pythonRoot ?? null,
+    pythonRootSource: config.pythonRootSource ?? null,
     pythonCandidates: config.pythonCandidates,
     args: config.args,
     cwd: config.cwd,
@@ -137,6 +172,8 @@ export function describeConfig(config, extra = {}) {
     prefix: config.prefix,
     timeoutMs: config.timeoutMs,
     restart: config.restart,
+    workspaceRoot: config.workspaceRoot ?? null,
+    confirmOutsideWorkspace: config.confirmOutsideWorkspace !== false,
     ...extra,
   };
 }

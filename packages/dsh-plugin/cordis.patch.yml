@@ -25,3 +25,9 @@
         # Empty includeTools = publish every tool the server advertises.
         includeTools: []
         excludeTools: []
+        # Write destinations outside the session workspace require a one-shot
+        # approval. Set false only when an external policy already enforces it.
+        confirmOutsideWorkspace: true
+        # Optional fallback workspace root before DSH's sandbox policy is
+        # available. Empty = use the session policy / cwd.
+        workspaceRoot: ''

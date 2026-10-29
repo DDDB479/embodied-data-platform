@@ -50,6 +50,14 @@ class McpProtocolTestCase(unittest.TestCase):
             self.assertIn("name", tool)
             self.assertIn("description", tool)
             self.assertEqual(tool["inputSchema"]["type"], "object")
+            self.assertEqual(
+                set(tool["annotations"]),
+                {"readOnlyHint", "destructiveHint", "openWorldHint"},
+            )
+            self.assertIs(tool["annotations"]["openWorldHint"], False)
+        by_name = {tool["name"]: tool for tool in result["tools"]}
+        self.assertTrue(by_name["list_formats"]["annotations"]["readOnlyHint"])
+        self.assertFalse(by_name["convert_dataset"]["annotations"]["readOnlyHint"])
 
     def test_unknown_method_is_an_error(self) -> None:
         response = _rpc("does/not/exist")

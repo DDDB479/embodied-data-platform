@@ -441,6 +441,21 @@ TOOLS: list[dict[str, Any]] = [
 
 _BY_NAME: dict[str, dict[str, Any]] = {tool["name"]: tool for tool in TOOLS}
 
+# Hosts such as Codex treat an MCP tool without safety annotations as a write
+# action and require approval before calling it. Keep these declarations close
+# to the registry so the server's advertised behavior stays auditable.
+_WRITE_TOOLS = {"labeling_tasks", "convert_dataset", "scaffold_project", "catalog_index"}
+
+
+def _annotations(tool: dict[str, Any]) -> dict[str, bool]:
+    name = tool["name"]
+    read_only = name not in _WRITE_TOOLS
+    return {
+        "readOnlyHint": read_only,
+        "destructiveHint": name in {"labeling_tasks", "convert_dataset", "scaffold_project"},
+        "openWorldHint": False,
+    }
+
 
 def list_tools() -> list[dict[str, Any]]:
     return [
@@ -448,6 +463,7 @@ def list_tools() -> list[dict[str, Any]]:
             "name": tool["name"],
             "description": tool["description"],
             "inputSchema": tool["inputSchema"],
+            "annotations": _annotations(tool),
         }
         for tool in TOOLS
     ]

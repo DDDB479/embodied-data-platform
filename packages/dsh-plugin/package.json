@@ -12,6 +12,8 @@
   "files": [
     "index.js",
     "src",
+    "python",
+    "scripts/probe.mjs",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -54,6 +56,9 @@
     "node": "^22.19 || >=24"
   },
   "scripts": {
-    "probe": "node scripts/probe.mjs"
+    "prepack": "node scripts/prepack.mjs",
+    "postpack": "node scripts/postpack.mjs",
+    "probe": "node scripts/probe.mjs",
+    "test": "node --test test/*.test.mjs"
   }
 }

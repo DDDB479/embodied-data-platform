@@ -8,6 +8,7 @@
  * for forwarding.
  */
 import { describeConfig } from './config.js';
+import { isReadOnlyTool, prepareToolCall } from './safety.js';
 
 /** Structural schema for every tool result: the raw payload rides in `data`. */
 export const OUTPUT_SCHEMA = {
@@ -67,11 +68,13 @@ function filterTools(tools, config) {
 }
 
 /**
- * @param {Array<{name:string,description?:string,inputSchema?:object}>} tools
+ * @param {Array<{name:string,description?:string,inputSchema?:object,annotations?:object}>} tools
  * @param {import('./mcp.js').McpClient} client
  * @param {object} config
+ * @param {object} logger
+ * @param {object} [ctx] cordis context used for workspace policy and approvals
  */
-export function buildToolDefinitions(tools, client, config, logger = console) {
+export function buildToolDefinitions(tools, client, config, logger = console, ctx = null) {
   return filterTools(tools, config).map((tool) => {
     const name = sanitize(tool.name, config.prefix);
     const description = tool.description || `Embodied data tool: ${tool.name}`;
@@ -83,16 +86,21 @@ export function buildToolDefinitions(tools, client, config, logger = console) {
         schema: OUTPUT_SCHEMA,
         render: (_args, value) => [{ type: 'text', text: formatPayload(value?.data ?? value, config.maxOutputChars) }],
       },
-      isConcurrencySafe: () => true,
+      // Only read-only MCP tools are safe to run in parallel. Write tools keep
+      // the DSH default (serial) so two conversions cannot race on one target.
+      ...(isReadOnlyTool(tool) ? { isConcurrencySafe: () => true } : {}),
       async execute(args, exec = {}) {
-        const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+        const raw = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
         try {
+          const input = await prepareToolCall({ ctx, tool, args: raw, exec, config, logger });
           const data = await client.callTool(tool.name, input, { signal: exec.signal });
           return { tool: tool.name, ok: true, data };
         } catch (error) {
           if (error && (error.code === 'ABORTED' || error.code === 'DISPOSED')) throw error;
           logger?.warn?.(`embodied-data: ${tool.name} failed: ${error?.message ?? error}`);
-          throw new Error(`embodied-data: ${tool.name} failed: ${error?.message ?? error}`);
+          const wrapped = new Error(`embodied-data: ${tool.name} failed: ${error?.message ?? error}`);
+          if (error?.code) wrapped.code = error.code;
+          throw wrapped;
         }
       },
     };

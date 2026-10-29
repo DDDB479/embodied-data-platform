@@ -84,7 +84,7 @@ export function apply(ctx, rawConfig) {
     void (async () => {
       try {
         const tools = await client.listTools();
-        for (const definition of buildToolDefinitions(tools, client, config, ctx?.logger ?? console)) add(definition);
+        for (const definition of buildToolDefinitions(tools, client, config, ctx?.logger ?? console, ctx)) add(definition);
         log(ctx, 'info', `dsh-embodied-data: ${state.tools.length} tool(s) ready (python root: ${config.pythonRoot ?? 'auto'})`);
       } catch (error) {
         log(ctx, 'warn', `dsh-embodied-data: MCP server unavailable — ${errorText(error)}. Only self-check is registered.`);
@@ -109,5 +109,5 @@ export function apply(ctx, rawConfig) {
   }
 }
 
-export { resolveConfig } from './src/config.js';
+export { isPythonRoot, locatePythonRoot, resolveConfig } from './src/config.js';
 export { McpClient } from './src/mcp.js';

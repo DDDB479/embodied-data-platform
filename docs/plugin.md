@@ -22,6 +22,14 @@ pnpm add "link:D:/具身平台插件开发/packages/dsh-plugin"
 
 `link:` 让 profile 直接引用仓库目录，改插件代码不需要重新安装。pnpm 会提示 `@deepseek-ai/cordis`、`@deepseek-ai/dsh` 两个 peer 依赖未解析——它们是 `optional`，由 Harness 进程自己提供，忽略即可。
 
+从 npm tarball 安装时不需要 `link:`，也不需要额外 `pip install`：
+
+```bash
+pnpm add dsh-embodied-data
+```
+
+发布包在 `prepack` 阶段把 `src/embodied_core` 复制到 `python/embodied_core`，运行时自动探测这个内置目录。仓库开发仍用 `link:`，这样改 Python 源码立即生效。可选的 `pyarrow`/`h5py`/`mcap` 读取器仍装在使用它的 Python 环境里。
+
 ### 2. 在 profile 的 package.json 里登记 bundle
 
 ```json
@@ -60,7 +68,7 @@ pnpm add "link:D:/具身平台插件开发/packages/dsh-plugin"
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
 | `python` | `""` | Python 解释器绝对路径；空则按 `EMBODIED_PYTHON`/`DSH_PYTHON`/`PYTHON`/`python3`/`python` 顺序探测 |
-| `pythonRoot` | 自动探测 | 含 `src/embodied_core` 的目录；不写则从插件目录向上 6 层找 |
+| `pythonRoot` | 自动探测 | 含 `src/embodied_core` 或 `embodied_core` 的目录；优先使用包内 `python/`，其次向上查找仓库源码，最后尝试 `pythonPath`/`PYTHONPATH` 里的已安装包 |
 | `pythonPath` | `[]` | 额外加入 `PYTHONPATH` 的目录（相对插件根解析，例如工作区共享的 `.devtools/pydeps`） |
 | `prefix` | `"embodied_"` | 注册到 Harness 的工具名前缀 |
 | `timeoutMs` | `120000` | 单次工具调用超时 |
@@ -70,6 +78,8 @@ pnpm add "link:D:/具身平台插件开发/packages/dsh-plugin"
 | `includeTools` | `[]` | 只暴露这些 MCP 工具（空=全部） |
 | `excludeTools` | `[]` | 屏蔽这些 MCP 工具 |
 | `maxOutputChars` | `24000` | 单次输出截断长度，防止大 JSON 冲爆上下文 |
+| `confirmOutsideWorkspace` | `true` | 写工具目标在工作区外时要求一次性审批；无审批服务时失败关闭 |
+| `workspaceRoot` | `""` | 可选的兜底工作区根；空则使用 DSH sandbox policy 或会话 cwd |
 
 示例（把依赖目录也带上）：
 
@@ -115,6 +125,23 @@ detect        {"format":"lerobot","version":"v2.1","confidence":0.98,...}
 | `python root (not found)` | 插件找不到 `embodied_core` | 设 `pythonPath`，或把 `src` 加进 `PYTHONPATH` |
 | `tools 1` | MCP 没起来，只剩自检工具 | 看 `embodied_self_check` 的 `server` 字段；多为解释器路径错或缺依赖 |
 | `frames_unavailable` | 缺 `pyarrow`/`h5py`/`mcap` | 装依赖，或在 `pythonPath` 里指到已装好的目录 |
+
+验证发布包而不是源码目录：
+
+```bash
+node tools/check_clean_install.mjs \
+  --python /abs/path/to/python \
+  --fixture .devtools/fixtures/lerobot_v21
+```
+
+这个脚本会执行 `pack → 临时目录安装 → 解析内置 Python → 启动 MCP → detect`，用来防止“仓库里能跑、装完就坏”的回归。
+
+## 写入安全
+
+- 只读工具（detect / summarize / validate / quality / segment / catalog search…）声明为可并发。
+- 写工具（`convert_dataset`、`scaffold_project`、`catalog_index`、带 `out` 的 `labeling_tasks`）不声明并发，DSH 会串行调度。
+- 写目标不在 DSH 工作区内时，插件通过 `ctx.get('approval').request(...)` 申请一次 `allowed-once`；拒绝、不可用或只读模式都会阻止写入。
+- 相对路径参数统一按会话工作区解析，不再相对 Python 子进程的安装目录。
 
 ## 与 MCP 的关系
 

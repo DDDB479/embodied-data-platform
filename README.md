@@ -1,6 +1,6 @@
 # Embodied Data Studio
 
-给具身智能数据平台开发者的一套工具：**格式识别 / 校验 / 质检 / 标注任务生成 / 格式转换 / 数据集编目 / 项目脚手架**，同时以三种形态提供——
+给具身智能数据平台开发者的一套工具：**格式识别 / 校验 / 质检 / 标注任务生成 / 格式转换 / 数据集编目 / 项目脚手架**，同时以四种形态提供——
 
 | 形态 | 入口 | 给谁用 |
 | --- | --- | --- |
@@ -98,7 +98,7 @@ D:\具身平台插件开发\
 │   ├── cli.py                  # embodied 命令
 │   └── mcp_server.py           # 零依赖 MCP stdio 服务
 ├── packages/dsh-plugin/        # 零依赖 ESM 插件（JS 只做 MCP 桥接）
-├── tests/                      # unittest（pytest 兼容），91 项
+├── tests/                      # unittest（pytest 兼容），94 项
 ├── tools/                      # 夹具生成 + 端到端脚本
 ├── examples/                   # 可直接运行的示例
 └── docs/
@@ -107,9 +107,11 @@ D:\具身平台插件开发\
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -t .     # 91 项单元测试，或用 pytest
+python -m unittest discover -s tests -t .     # 94 项单元测试，或用 pytest
 python tools/e2e.py                           # 16 项端到端（需先 tools/make_fixtures.py 生成夹具）
 node packages/dsh-plugin/scripts/probe.mjs    # 插件自检（mock cordis ctx）
+node --test packages/dsh-plugin/test/*.test.mjs  # 13 项插件单测（路径/并发/审批）
+node tools/check_clean_install.mjs --python /abs/path/to/python  # 打包后临时安装并探测
 ```
 
 夹具、离线 wheel 与本地依赖树放在 `.devtools/`（已在 `.gitignore` 中）：`tools/make_fixtures.py` 生成 `.devtools/fixtures/`，`pip install` 不可用时把 wheel 解压到 `.devtools/pydeps/` 并加进 `PYTHONPATH`。
@@ -118,7 +120,9 @@ Python 依赖全部可选：核心只需要 `numpy`；parquet 要 `pyarrow`，HD
 
 ## 状态
 
-- 核心库、CLI、MCP、DSH 插件均已跑通（91 项单元测试 + 16 项端到端 + 插件 probe）。
+- 核心库、CLI、MCP、DSH 插件均已跑通（94 项 Python 单测 + 13 项插件单测 + 16 项端到端 + 插件 probe + 干净安装）。
 - 插件已装进本机 profile（`~/.dsh/profiles/desktop`）并在 Harness 会话里实测：14 个 `embodied_*` 工具可用，live 调用 detect / summarize / quality 返回真实数据。
+- npm 发布包会在 `prepack` 时内置 `python/embodied_core`，安装后自动解析，不再依赖仓库源码路径。
+- 写工具默认串行；工作区外目标需要一次性审批，避免转换/脚手架并发覆盖或越界写入。
 - RLDS/MCAP 目前是 metadata 级支持：能识别、统计、校验，但读不到逐帧张量（需要 TensorFlow / CDR schema 解码），`frames()` 会显式抛 `FramesUnavailable`。
 - 视频流（LeRobot `observation.images.*`）只做元数据描述，不解码像素。

@@ -9,6 +9,8 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 
 每个工具返回**一个 JSON 文本块**。成功时是业务数据本身；失败时是 `{"error": {"code": "...", "message": "..."}}`，不会抛协议级异常——模型可以读到错误并自行纠正。
 
+`tools/list` 会为每个工具附带 MCP annotations：读工具 `readOnlyHint: true`，写工具 `readOnlyHint: false`。写工具包括 `labeling_tasks`（仅在传 `out` 时落盘）、`convert_dataset`、`scaffold_project` 和 `catalog_index`。支持审批的宿主会据此提示；DSH 插件还会额外把写工具设为串行，并对工作区外目标申请一次性审批。
+
 ---
 
 ## 1. `detect_dataset`
