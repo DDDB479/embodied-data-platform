@@ -188,7 +188,7 @@ class RLDSDataset(DatasetObject):
     def optional_dependencies() -> dict[str, str]:
         return {"tensorflow": "decode TFRecord example protos (tensorflow / tensorflow-datasets)"}
 
-    def frames(self, episodes=None, features=None):  # noqa: ANN001
+    def frames(self, episodes=None, features=None, *, max_frames=None):  # noqa: ANN001
         raise FramesUnavailable("RLDS frames live in TFRecord example protos; install tensorflow or convert with tfds")
 
 

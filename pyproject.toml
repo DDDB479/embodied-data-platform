@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "embodied-core"
-version = "0.1.0"
+version = "0.3.0"
 description = "Format-aware toolkit for embodied-AI robotics datasets: detect, validate, QC, catalog, convert, scaffold."
 readme = "README.md"
 requires-python = ">=3.10"

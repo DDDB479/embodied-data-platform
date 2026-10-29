@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -98,6 +100,75 @@ class CatalogTestCase(unittest.TestCase):
     def test_stats_without_database_raises(self) -> None:
         with self.assertRaises(FileNotFoundError):
             catalog.stats(self.root / "missing.db")
+
+    def test_schema_v2_records_versions_runs_and_lineage(self) -> None:
+        first = self._index()
+        self.assertEqual(first["schema_version"], 2)
+        self.assertGreaterEqual(first["versions_added"], 3)
+        stats = catalog.stats(self.db)
+        self.assertEqual(stats["schema_version"], 2)
+        self.assertGreaterEqual(stats["total_versions"], stats["total_datasets"])
+        self.assertGreaterEqual(stats["total_runs"], 1)
+
+        target = self.tree / "pick-cube" / "episodes.jsonl"
+        target.write_text(target.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        changed = self._index()
+        self.assertGreaterEqual(changed["versions_added"], 1)
+        self.assertGreaterEqual(changed["lineage_added"], 1)
+
+        rows = catalog.versions(self.db, path=self.tree / "pick-cube")
+        self.assertGreaterEqual(len(rows), 2)
+        edges = catalog.lineage(self.db, path=self.tree / "pick-cube")
+        self.assertTrue(edges)
+        self.assertEqual(edges[0]["relation"], "supersedes")
+        self.assertGreaterEqual(len(catalog.runs(self.db)), 2)
+
+    def test_history_combines_tables(self) -> None:
+        self._index()
+        body = catalog.history(self.db, limit=10)
+        self.assertEqual(body["schema_version"], 2)
+        self.assertTrue(body["versions"])
+        self.assertTrue(body["runs"])
+
+    def test_v1_database_is_migrated_in_place(self) -> None:
+        db = self.root / "legacy.db"
+        conn = sqlite3.connect(db)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE datasets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL, format TEXT NOT NULL,
+                    version TEXT, episodes INTEGER, frames INTEGER, duration_s REAL, fps REAL,
+                    robot_type TEXT, tasks TEXT, features TEXT, notes TEXT, meta TEXT, score INTEGER,
+                    marker TEXT, mtime REAL, size INTEGER, indexed_at REAL
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO datasets(path, format, version, episodes, frames, duration_s, fps, robot_type, "
+                "tasks, features, notes, meta, score, marker, mtime, size, indexed_at) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str((self.tree / "pick-cube").resolve()), "embodied-jsonl", "1.0", 2, 60, 2.0, 30.0,
+                    "so100", "[]", "[]", "[]", "{}", 90, "marker", time.time(), 100, time.time(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        migrated = catalog.connect(db)
+        try:
+            version = migrated.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 2)
+        finally:
+            migrated.close()
+        stats = catalog.stats(db)
+        self.assertEqual(stats["schema_version"], 2)
+        self.assertEqual(stats["total_datasets"], 1)
+        self.assertGreaterEqual(stats["total_versions"], 1)
+        self.assertGreaterEqual(stats["total_runs"], 1)
+        found = catalog.search(db)
+        self.assertEqual(found[0]["episodes"], 2)
 
 
 if __name__ == "__main__":

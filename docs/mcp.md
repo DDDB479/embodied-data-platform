@@ -11,6 +11,18 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 
 `tools/list` 会为每个工具附带 MCP annotations：读工具 `readOnlyHint: true`，写工具 `readOnlyHint: false`。写工具包括 `labeling_tasks`（仅在传 `out` 时落盘）、`convert_dataset`、`scaffold_project` 和 `catalog_index`。支持审批的宿主会据此提示；DSH 插件还会额外把写工具设为串行，并对工作区外目标申请一次性审批。
 
+## 进度通知与异步作业
+
+`quality_report`、`validate_dataset` 和 `quality_gate` 支持 MCP 标准进度通知。调用时在 `tools/call` 的 `params._meta` 里放一个令牌：
+
+```json
+{"name": "quality_report", "arguments": {"path": "/data/pick"}, "_meta": {"progressToken": "qc-1"}}
+```
+
+服务端会持续写 `notifications/progress`，`params` 形如 `{progressToken, progress, total: 100, message}`。没有令牌时不会发送通知，业务结果不受影响。
+
+长数据集建议走异步作业：`submit_job` 立即返回 `job_id`，`job_status` 轮询状态，成功后再用 `include_result=true` 取完整报告。作业只接受 `quality_report`、`validate_dataset` 和 `quality_gate` 三种只读分析，避免后台任务绕过工作区写审批。作业状态保存在当前 MCP 进程内，默认保留 1 小时（`EMBODIED_JOB_TTL_S`），并发数默认 2（`EMBODIED_JOB_WORKERS`）。
+
 ---
 
 ## 1. `detect_dataset`
@@ -79,14 +91,50 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 | `z` | number | | 鲁棒 z 阈值，默认 8.0 |
 | `include_segments` | boolean | | 一并返回 moving/idle 段 |
 | `skip_anomalies` | boolean | | 只要统计，跳过异常检测（大数据集提速） |
+| `use_cache` | boolean | | 默认 `true`；按数据集指纹 + 参数复用历史报告 |
+| `refresh_cache` | boolean | | 忽略已有缓存并重算，完成后覆盖该键 |
+| `chunk_frames` | int | | 每块帧数，默认 50000 / `EMBODIED_CHUNK_FRAMES` |
+| `max_frames` | int | | 硬上限，默认 2000000 / `EMBODIED_MAX_FRAMES`；`0` 表示不限 |
 
-返回 `{dataset, stats, anomalies[], anomaly_counts, segments?}`，`dataset` 是精简后的 summary。
+返回 `{dataset, stats, anomalies[], anomaly_counts, segments?, scan, cache}`，`dataset` 是精简后的 summary。`scan` 含 `{streamed, chunks, frames_scanned, chunk_frames, max_frames, truncated}`。分块聚合时 min/max/mean/std 与非有限值计数精确；跨多块时 `median/p05/p95` 是带 `percentiles_estimated=true` 的加权估计。`cache` 含 `{enabled, hit, key, fingerprint, files, bytes, compute_ms, age_s?, hits?, error?}`。
+
+缓存键 = 数据集路径 + 全量文件指纹（相对路径、大小、mtime）+ 规范化参数 + 算法版本。任何文件变化、`z`/特征/episode 过滤变化都会自动 miss；`refresh_cache` 用于强制重算。缓存默认写到用户缓存目录（Windows `%LOCALAPPDATA%\embodied-data`，Linux `$XDG_CACHE_HOME`），可用 `EMBODIED_QUALITY_CACHE` 指定 SQLite 文件。MCP 不接受调用方传任意 `cache_path`，避免把只读工具变成未审批的写操作。
 
 `stats[key]` = `{dims, frames, nan_count, inf_count, nan_ratio, min, max, mean, std, median, p05, p95, norm_mean, norm_max, near_zero_ratio}`。
 
 `anomalies[]` = `{code, severity, episode, feature, start_frame, end_frame, frames, detail, start_s?, end_s?}`，`code ∈ {jump, stall, non_finite}`。有时间戳/fps 时附带秒数，方便和对齐视频。
 
 记账列（`episode_index`、`frame_index`、`index`、`task_index`、`timestamp`）不参与异常检测——它们天然单调或分段恒定，扫描只会制造假阳性。
+
+---
+
+## 4b. `quality_gate`
+
+按策略判断数据集能否入库/发布。只读，可作为后台 job。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | ✓ | 数据集路径 |
+| `rules` | object | | 内联规则；省略项使用训练默认值 |
+
+常用规则：
+
+```json
+{
+  "expected_fps": 30,
+  "fps_tolerance": 0.5,
+  "required_features": ["observation.state", "action"],
+  "required_feature_kinds": ["state", "action"],
+  "min_score": 80,
+  "max_errors": 0,
+  "max_nan_ratio": 0.01,
+  "max_jump_windows": 0,
+  "max_stall_windows": 5,
+  "max_anomaly_windows": 10
+}
+```
+
+返回 `{ok, score, rules, gate:{passed, failure_count, failures[]}, validation, quality?, issues[], errors, warnings, infos}`。`failures[].code` 稳定为 `gate.fps_mismatch`、`gate.required_features`、`gate.score`、`gate.nan_ratio`、`gate.anomaly_windows` 等。
 
 ---
 
@@ -181,7 +229,7 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 | `force` | boolean | | 忽略 mtime/size 缓存，强制重扫 |
 | `validate` | boolean | | 索引时顺带跑校验拿分数（慢） |
 
-返回 `{db, root, added, updated, skipped, failed, total, failures[]}`。增量依据是数据集的 marker 文件（`meta/info.json`、`episodes.jsonl` 等，取最新的 mtime）+ 目录大小。
+返回 `{schema_version, db, root, run_id, run_key, added, updated, skipped, failed, versions_added, lineage_added, total, total_versions, failures[]}`。增量依据是 marker 文件的 mtime/size；真正变化时计算全量文件指纹并为该数据集写一个不可变版本。
 
 ### `catalog_search`
 
@@ -200,7 +248,17 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 
 ### `catalog_stats`
 
-只要 `db`。返回 `{total_datasets, by_format, total_episodes, total_frames, total_duration_s, robot_types[], last_indexed}`。
+只要 `db`。返回 `{schema_version, total_datasets, total_versions, total_runs, lineage_edges, by_format, total_episodes, total_frames, total_duration_s, robot_types[], last_indexed, last_run}`。
+
+### `catalog_history`
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `db` | string | ✓ | 编目文件 |
+| `path` | string | | 只看某个数据集 |
+| `limit` | int | | 默认 20 |
+
+返回 `{schema_version, versions[], lineage[], runs[]}`。版本表是不可变快照；文件指纹变化时新版本通过 `supersedes` 边指向前一版，可用于追溯数据从哪次 ingest/转换/清洗而来。
 
 ---
 
@@ -223,11 +281,53 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 
 ---
 
+## 14. `submit_job`
+
+启动后台只读分析。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `tool` | string | ✓ | `quality_report`、`validate_dataset` 或 `quality_gate` |
+| `arguments` | object | ✓ | 与直接调用同名工具相同的参数 |
+
+返回 `{job, poll_with, hint}`，`job` 含 `job_id / tool / status / progress / message / created_at`。如果调用携带 `_meta.progressToken`，后续 `notifications/progress` 也使用同一个令牌。
+
+---
+
+## 15. `job_status`
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `job_id` | string | ✓ | `submit_job` 返回的 id |
+| `include_result` | boolean | | 成功时一并返回完整报告，默认 false |
+
+返回任务状态：`queued / running / cancelling / succeeded / failed / cancelled`，以及 `progress / message / duration_s / result_ready / error`。失败时 `error` 是稳定的 `{code, type, message}`。未知 id 返回 `job_not_found`。
+
+---
+
+## 16. `cancel_job`
+
+请求协作式取消。运行中的任务会在下一个分析检查点停止；排队中的任务立即变为 `cancelled`。取消后仍可用 `job_status` 确认最终状态。
+
+---
+
+## 17. `list_jobs`
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `limit` | int | | 默认 20 |
+| `status` | string | | 只看某个状态 |
+
+返回 `{count, jobs[]}`，按创建时间倒序。用于排查"上次那个大质检跑完没有"。
+
+---
+
 ## 错误码
 
 | code | 含义 | 怎么办 |
 | --- | --- | --- |
 | `unsupported_format` | 路径存在但认不出 | 先用 `list_formats` 看支持范围；新格式写 adapter |
 | `frames_unavailable` | 能识别但读不到帧 | 按返回的 `install` 装可选依赖 |
+| `frame_limit_exceeded` | 本次物化超过 `max_frames` | 减小 `chunk_frames`、改用 `iter_frames`，或显式提高上限 |
 | `not_found` | 路径不存在 | 检查路径 |
 | `bad_arguments` | 参数类型/取值不对 | 按提示修正 |

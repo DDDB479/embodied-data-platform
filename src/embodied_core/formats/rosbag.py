@@ -89,7 +89,7 @@ class Rosbag2Dataset(DatasetObject):
     def __init__(self, root: Path, summary: DatasetSummary) -> None:
         super().__init__(root, summary, capabilities={"streams", "episodes", "sqlite"})
 
-    def frames(self, episodes=None, features=None):  # noqa: ANN001
+    def frames(self, episodes=None, features=None, *, max_frames=None):  # noqa: ANN001
         raise FramesUnavailable("rosbag2 messages are CDR-encoded; decode a topic with its ROS message type first")
 
     def topics(self) -> list[dict[str, Any]]:
@@ -236,7 +236,7 @@ class Rosbag1Dataset(DatasetObject):
     def __init__(self, root: Path, summary: DatasetSummary) -> None:
         super().__init__(root, summary, capabilities={"streams", "episodes"})
 
-    def frames(self, episodes=None, features=None):  # noqa: ANN001
+    def frames(self, episodes=None, features=None, *, max_frames=None):  # noqa: ANN001
         raise FramesUnavailable("rosbag1 payloads are ROS-serialised; decode a topic with its message definition first")
 
 

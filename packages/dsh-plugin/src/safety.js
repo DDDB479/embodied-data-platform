@@ -21,6 +21,7 @@ export const PATH_ARGUMENTS = Object.freeze({
   summarize_dataset: ['path'],
   validate_dataset: ['path'],
   quality_report: ['path'],
+  quality_gate: ['path'],
   segment_episodes: ['path'],
   labeling_tasks: ['path', 'out'],
   convert_dataset: ['source', 'destination'],
@@ -28,6 +29,7 @@ export const PATH_ARGUMENTS = Object.freeze({
   catalog_index: ['root', 'db'],
   catalog_search: ['db'],
   catalog_stats: ['db'],
+  catalog_history: ['db', 'path'],
   plan_windows: ['path'],
 });
 
@@ -126,6 +128,13 @@ export function resolveWorkspace(ctx, exec, config) {
  */
 export function normalizePathArguments(toolName, args, workspaceRoot) {
   const fields = PATH_ARGUMENTS[toolName] ?? [];
+  if (toolName === 'submit_job' && args?.arguments && typeof args.arguments === 'object' && !Array.isArray(args.arguments)) {
+    const nested = { ...args.arguments };
+    if (typeof nested.path === 'string' && nested.path.trim() !== '') {
+      nested.path = path.resolve(workspaceRoot, expandHome(nested.path));
+    }
+    return { ...args, arguments: nested };
+  }
   if (fields.length === 0 || !args || typeof args !== 'object') return args ?? {};
   const normalized = { ...args };
   for (const field of fields) {

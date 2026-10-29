@@ -13,6 +13,7 @@ structural checks that do not need tabular data.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -26,6 +27,9 @@ ACTION_PREFIXES = ("action", "actions", "ctrl", "command")
 IMAGE_HINTS = ("image", "rgb", "depth", "camera", "video")
 LANGUAGE_HINTS = ("language", "instruction", "task", "prompt", "caption")
 
+DEFAULT_CHUNK_FRAMES = 50_000
+DEFAULT_MAX_FRAMES = 2_000_000
+
 
 class FramesUnavailable(RuntimeError):
     """Raised when tabular frame access needs an optional dependency."""
@@ -34,6 +38,69 @@ class FramesUnavailable(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.install = install
+
+
+class FrameLimitExceeded(RuntimeError):
+    """Raised when a caller asks for more frames than its memory budget allows."""
+
+    def __init__(self, limit: int, frames: int, *, hint: str | None = None) -> None:
+        self.limit = int(limit)
+        self.frames = int(frames)
+        self.hint = hint
+        super().__init__(
+            f"frame limit exceeded: {self.frames} > {self.limit}; "
+            "use iter_frames(..., chunk_frames=...) or raise max_frames/EMBODIED_MAX_FRAMES"
+        )
+
+
+def _env_positive_int(name: str, default: int, *, allow_zero: bool = False) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    if value < 0 or (value == 0 and not allow_zero):
+        return default
+    return value
+
+
+def resolve_chunk_frames(value: int | None) -> int:
+    """Resolve a per-chunk frame budget."""
+
+    if value is not None:
+        resolved = int(value)
+        if resolved < 1:
+            raise ValueError("chunk_frames must be at least 1")
+        return resolved
+    return _env_positive_int("EMBODIED_CHUNK_FRAMES", DEFAULT_CHUNK_FRAMES)
+
+
+def resolve_max_frames(value: int | None) -> int:
+    """Resolve the total materialization budget. Zero means unlimited."""
+
+    if value is not None:
+        resolved = int(value)
+        if resolved < 0:
+            raise ValueError("max_frames must be >= 0 (0 means unlimited)")
+        return resolved
+    return _env_positive_int("EMBODIED_MAX_FRAMES", DEFAULT_MAX_FRAMES, allow_zero=True)
+
+
+@dataclass
+class FrameChunk:
+    """One bounded slice of numeric frames.
+
+    ``offsets`` maps an episode id to the local frame number of that episode's
+    first occurrence in this chunk. Consumers can shift chunk-local anomaly
+    windows back to episode-local coordinates with it.
+    """
+
+    ids: list[int]
+    columns: dict[str, np.ndarray]
+    offsets: dict[int, int] = field(default_factory=dict)
+
+    @property
+    def frames(self) -> int:
+        return len(self.ids)
 
 
 @dataclass
@@ -119,12 +186,43 @@ class DatasetObject:
         self,
         episodes: Sequence[int] | None = None,
         features: Sequence[str] | None = None,
+        *,
+        max_frames: int | None = None,
     ) -> tuple[list[int], dict[str, np.ndarray]]:
         """Return ``(episode_ids, columns)`` for tabular features.
 
         ``columns`` is keyed by feature name and always 2-D (frames x dim).
+        ``max_frames`` is a materialization guard. Prefer :meth:`iter_frames`
+        for datasets that do not fit in memory.
         """
         raise FramesUnavailable(f"{self.summary.format} does not expose tabular frames through this adapter")
+
+    def iter_frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        chunk_frames: int | None = None,
+        max_frames: int | None = None,
+    ) -> Iterator[FrameChunk]:
+        """Yield bounded frame chunks.
+
+        The default implementation slices ``frames()``; adapters with a native
+        iterator override it so large parquet/HDF5 files never materialize at
+        once. ``max_frames=0`` means unlimited.
+        """
+
+        limit = resolve_max_frames(max_frames)
+        size = resolve_chunk_frames(chunk_frames)
+        ids, columns = self.frames(episodes, features, max_frames=limit)
+        seen: dict[int, int] = {}
+        for start in range(0, len(ids), size):
+            stop = min(len(ids), start + size)
+            chunk_ids = list(ids[start:stop])
+            offsets = {episode: seen.get(episode, 0) for episode in dict.fromkeys(chunk_ids)}
+            for episode in chunk_ids:
+                seen[episode] = seen.get(episode, 0) + 1
+            yield FrameChunk(chunk_ids, {key: values[start:stop] for key, values in columns.items()}, offsets)
 
     def help(self) -> dict[str, Any]:
         return {
@@ -172,3 +270,28 @@ def episode_records_from_lengths(
             )
         )
     return out
+
+
+def collect_frame_chunks(chunks: Iterable[FrameChunk], *, max_frames: int | None = None) -> tuple[list[int], dict[str, np.ndarray]]:
+    """Collect chunks for the legacy ``frames()`` API with a hard frame cap."""
+
+    limit = resolve_max_frames(max_frames)
+    ids: list[int] = []
+    parts: dict[str, list[np.ndarray]] = {}
+    common: set[str] | None = None
+    for chunk in chunks:
+        seen = len(ids) + len(chunk.ids)
+        if limit and seen > limit:
+            raise FrameLimitExceeded(limit, seen)
+        ids.extend(chunk.ids)
+        keys = set(chunk.columns)
+        common = keys if common is None else common & keys
+        for key, values in chunk.columns.items():
+            parts.setdefault(key, []).append(values)
+    columns: dict[str, np.ndarray] = {}
+    for key in common or set():
+        try:
+            columns[key] = np.concatenate(parts[key], axis=0)
+        except ValueError:
+            continue
+    return ids, columns

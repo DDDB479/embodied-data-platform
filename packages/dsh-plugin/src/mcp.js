@@ -47,6 +47,9 @@ export class McpClient {
     this.lastError = null;
     this.disposed = false;
     this.spawnedWith = null;
+    this.progress = new Map();
+    this.progressListeners = new Set();
+    this.nextProgressId = 1;
   }
 
   /** Environment for the child process: inherit, then layer the config. */
@@ -121,7 +124,7 @@ export class McpClient {
     await this.request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: 'dsh-embodied-data', version: '0.1.0' },
+      clientInfo: { name: 'dsh-embodied-data', version: '0.3.0' },
     }, { timeoutMs: this.config.startupTimeoutMs, skipEnsure: true });
     this.#write({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
     return child;
@@ -142,17 +145,42 @@ export class McpClient {
    * Invoke a tool and unwrap the MCP content envelope.
    * @returns {Promise<unknown>} parsed JSON payload, or `{ text }` for prose results
    */
-  async callTool(name, args = {}, { timeoutMs, signal } = {}) {
-    const result = await this.request(
-      'tools/call',
-      { name, arguments: args ?? {} },
-      { timeoutMs: timeoutMs ?? this.config.timeoutMs, signal },
-    );
-    const payload = unwrapContent(result);
-    if (result?.isError) {
-      throw new McpError(typeof payload === 'string' ? payload : payload?.error ?? 'tool failed', { code: 'TOOL_ERROR', data: payload });
+  async callTool(name, args = {}, { timeoutMs, signal, onProgress, progressToken } = {}) {
+    const wantsProgress = Boolean(onProgress) || progressToken !== undefined;
+    const token = progressToken ?? (wantsProgress ? `dsh-progress-${this.nextProgressId++}` : undefined);
+    const params = { name, arguments: args ?? {} };
+    if (token !== undefined) params._meta = { progressToken: token };
+    let unsubscribe = null;
+    if (onProgress && token !== undefined) {
+      unsubscribe = this.onProgress((event) => {
+        if (String(event.progressToken) === String(token)) onProgress(event);
+      });
     }
-    return payload;
+    try {
+      const result = await this.request(
+        'tools/call',
+        params,
+        { timeoutMs: timeoutMs ?? this.config.timeoutMs, signal },
+      );
+      const payload = unwrapContent(result);
+      if (result?.isError) {
+        throw new McpError(typeof payload === 'string' ? payload : payload?.error ?? 'tool failed', { code: 'TOOL_ERROR', data: payload });
+      }
+      return payload;
+    } finally {
+      if (unsubscribe) unsubscribe();
+    }
+  }
+
+  /** Subscribe to MCP `notifications/progress` events. */
+  onProgress(listener) {
+    this.progressListeners.add(listener);
+    return () => this.progressListeners.delete(listener);
+  }
+
+  /** Latest progress event retained for a token, or null. */
+  lastProgress(token) {
+    return this.progress.get(String(token)) ?? null;
   }
 
   /** Send a JSON-RPC request and await its matching response. */
@@ -243,7 +271,10 @@ export class McpClient {
 
   #dispatch(message) {
     if (!message || typeof message !== 'object') return;
-    if (message.id === undefined || message.id === null) return; // notification
+    if (message.id === undefined || message.id === null) {
+      this.#onNotification(message);
+      return;
+    }
     const entry = this.pending.get(message.id);
     if (!entry) return;
     if (message.error) {
@@ -251,6 +282,31 @@ export class McpClient {
       return;
     }
     entry.resolve(message.result);
+  }
+
+  #onNotification(message) {
+    if (message.method !== 'notifications/progress' || !message.params) return;
+    const token = message.params.progressToken;
+    if (token === undefined || token === null) return;
+    const event = {
+      progressToken: token,
+      progress: Number(message.params.progress ?? 0),
+      total: Number(message.params.total ?? 100),
+      message: typeof message.params.message === 'string' ? message.params.message : '',
+      at: Date.now(),
+    };
+    this.progress.set(String(token), event);
+    if (this.progress.size > 100) {
+      const oldest = this.progress.keys().next().value;
+      this.progress.delete(oldest);
+    }
+    for (const listener of this.progressListeners) {
+      try {
+        listener(event);
+      } catch {
+        // A consumer callback must not break the JSON-RPC reader.
+      }
+    }
   }
 
   #onStderr(chunk) {
@@ -279,6 +335,7 @@ export class McpClient {
     const pending = [...this.pending.values()];
     this.pending.clear();
     for (const entry of pending) entry.reject(new McpError('Client disposed', { code: 'DISPOSED' }));
+    this.progressListeners.clear();
     if (child && child.exitCode === null && !child.killed) {
       try {
         child.stdin.end();

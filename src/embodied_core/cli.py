@@ -14,11 +14,24 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
-from .catalog import export_manifest, index as catalog_index, remove as catalog_remove, search as catalog_search, stats as catalog_stats
+from .cache import QualityCache
+from .catalog import (
+    export_manifest,
+    history as catalog_history,
+    index as catalog_index,
+    lineage as catalog_lineage,
+    remove as catalog_remove,
+    runs as catalog_runs,
+    search as catalog_search,
+    stats as catalog_stats,
+    versions as catalog_versions,
+)
 from .convert import ConversionError, convert
+from .gate import evaluate_quality_gate, load_quality_rules
 from .model import summarize_issues, to_jsonable
 from .quality import build_labeling_tasks, compute_dataset_stats, detect_anomalies, make_windows, segment_by_motion
 from .registry import UnsupportedFormat, describe_formats, detect_dataset, open_dataset
+from .reports import quality_report
 from .scaffold import scaffold
 from .validate import CHECKS, DEFAULT_CHECKS, run_checks, validate
 
@@ -112,25 +125,84 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0 if report.get("errors", 1) == 0 else 1
 
 
-def cmd_quality(args: argparse.Namespace) -> int:
-    dataset = _dataset_or_exit(args.path)
+def cmd_gate(args: argparse.Namespace) -> int:
     try:
-        try:
-            ids, columns = dataset.frames(args.episodes or None)
-        except Exception as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 4
-        payload: dict[str, Any] = {"stats": compute_dataset_stats(columns)}
-        if not args.no_anomalies:
-            payload["anomalies"] = detect_anomalies(ids, columns, fps=dataset.summary.fps, z=args.z, features=args.feature or None)
-            payload["anomaly_counts"] = {
-                key: sum(1 for item in payload["anomalies"] if item["severity"] == key) for key in ("error", "warn", "info")
-            }
-        if args.segments:
-            payload["segments"] = segment_by_motion(ids, columns, feature=args.feature, fps=dataset.summary.fps)
-        _emit(payload, args.json or True)
-    finally:
-        dataset.close()
+        rules = load_quality_rules(args.rules)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    overrides: dict[str, Any] = {}
+    if args.expected_fps is not None:
+        overrides["expected_fps"] = args.expected_fps
+    if args.fps_tolerance is not None:
+        overrides["fps_tolerance"] = args.fps_tolerance
+    if args.min_score is not None:
+        overrides["min_score"] = args.min_score
+    if args.max_nan_ratio is not None:
+        overrides["max_nan_ratio"] = args.max_nan_ratio
+    if args.require_feature:
+        overrides["required_features"] = args.require_feature
+    if args.frames:
+        overrides["include_frames"] = True
+    if args.no_cache:
+        overrides["use_cache"] = False
+    if args.chunk_frames is not None:
+        overrides["chunk_frames"] = args.chunk_frames
+    if args.max_frames is not None:
+        overrides["max_frames"] = args.max_frames
+    rules.update(overrides)
+    try:
+        payload = evaluate_quality_gate(args.path, rules=rules)
+    except FileNotFoundError:
+        print(f"error: no such path: {args.path}", file=sys.stderr)
+        return 2
+    except UnsupportedFormat as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    if args.json:
+        _emit(payload, True)
+    else:
+        print(f"{'PASS' if payload['ok'] else 'REJECT'}  {payload['path']}  score={payload['score']}")
+        for failure in payload["gate"]["failures"]:
+            print(f"  [{failure['code']}] {failure['message']}")
+    return 0 if payload["ok"] else 1
+
+
+def cmd_quality(args: argparse.Namespace) -> int:
+    try:
+        payload = quality_report(
+            args.path,
+            episodes=args.episodes or None,
+            features=args.feature or None,
+            z=args.z,
+            include_segments=args.segments,
+            skip_anomalies=args.no_anomalies,
+            use_cache=not args.no_cache,
+            cache_path=args.cache_path,
+            refresh_cache=args.refresh_cache,
+            chunk_frames=args.chunk_frames,
+            max_frames=args.max_frames,
+        )
+    except FileNotFoundError:
+        print(f"error: no such path: {args.path}", file=sys.stderr)
+        return 2
+    except UnsupportedFormat as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    _emit(payload, True)
+    return 0
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    cache = QualityCache(args.path)
+    if args.cache_command == "clear":
+        removed = cache.clear()
+        _emit({"cleared": removed, **cache.stats()}, True)
+    else:
+        _emit(cache.stats(), True)
     return 0
 
 
@@ -227,6 +299,21 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         else:
             _emit(manifest, True)
         return 0
+    if args.catalog_command == "versions":
+        rows = catalog_versions(args.db, path=args.path, limit=args.limit)
+        _emit({"count": len(rows), "versions": rows}, True)
+        return 0
+    if args.catalog_command == "lineage":
+        rows = catalog_lineage(args.db, path=args.path, version_id=args.version_id, limit=args.limit)
+        _emit({"count": len(rows), "lineage": rows}, True)
+        return 0
+    if args.catalog_command == "runs":
+        rows = catalog_runs(args.db, limit=args.limit, kind=args.kind, status=args.status)
+        _emit({"count": len(rows), "runs": rows}, True)
+        return 0
+    if args.catalog_command == "history":
+        _emit(catalog_history(args.db, path=args.path, limit=args.limit), True)
+        return 0
     print("error: missing catalog subcommand", file=sys.stderr)
     return 2
 
@@ -295,6 +382,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_validate)
 
+    p = sub.add_parser("gate", help="evaluate configurable publish rules")
+    p.add_argument("path")
+    p.add_argument("--rules", help="JSON/TOML rule file")
+    p.add_argument("--expected-fps", type=float)
+    p.add_argument("--fps-tolerance", type=float)
+    p.add_argument("--require-feature", action="append", help="required feature key (repeatable)")
+    p.add_argument("--min-score", type=int)
+    p.add_argument("--max-nan-ratio", type=float)
+    p.add_argument("--frames", action="store_true", help="include a frame-level scan")
+    p.add_argument("--chunk-frames", type=int, help="frames per streaming chunk")
+    p.add_argument("--max-frames", type=int, help="maximum frames to materialize (0 = unlimited)")
+    p.add_argument("--no-cache", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_gate)
+
     p = sub.add_parser("quality", help="feature statistics and anomaly windows")
     p.add_argument("path")
     p.add_argument("--episodes", nargs="*", type=int, help="restrict to these episode indices")
@@ -302,6 +404,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--z", type=float, default=8.0, help="robust z threshold for jump detection")
     p.add_argument("--no-anomalies", action="store_true")
     p.add_argument("--segments", action="store_true", help="include motion segments")
+    p.add_argument("--no-cache", action="store_true", help="recompute even when a cached report exists")
+    p.add_argument("--cache-path", help="quality cache SQLite path (default: per-user cache dir)")
+    p.add_argument("--refresh-cache", action="store_true", help="ignore and replace an existing cached report")
+    p.add_argument("--chunk-frames", type=int, help="frames per streaming chunk (default: 50000)")
+    p.add_argument("--max-frames", type=int, help="maximum frames to materialize (0 = unlimited)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_quality)
 
@@ -387,7 +494,38 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--db", default="catalog.db")
     c.add_argument("--limit", type=int, default=1000)
     c.add_argument("--out")
+
+    c = cat.add_parser("versions", parents=[common], help="list immutable dataset versions")
+    c.add_argument("--db", default="catalog.db")
+    c.add_argument("--path")
+    c.add_argument("--limit", type=int, default=50)
+
+    c = cat.add_parser("lineage", parents=[common], help="show version parent/child edges")
+    c.add_argument("--db", default="catalog.db")
+    c.add_argument("--path")
+    c.add_argument("--version-id", type=int)
+    c.add_argument("--limit", type=int, default=100)
+
+    c = cat.add_parser("runs", parents=[common], help="show catalog run records")
+    c.add_argument("--db", default="catalog.db")
+    c.add_argument("--kind")
+    c.add_argument("--status")
+    c.add_argument("--limit", type=int, default=20)
+
+    c = cat.add_parser("history", parents=[common], help="versions, lineage and runs together")
+    c.add_argument("--db", default="catalog.db")
+    c.add_argument("--path")
+    c.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_catalog)
+
+    p = sub.add_parser("cache", help="inspect or clear the quality report cache")
+    cache = p.add_subparsers(dest="cache_command", required=True)
+    c = cache.add_parser("stats", help="show cache entries, hits and size")
+    c.add_argument("--path", help="cache SQLite path (default: per-user cache dir)")
+    c.set_defaults(func=cmd_cache)
+    c = cache.add_parser("clear", help="delete cached reports")
+    c.add_argument("--path", help="cache SQLite path (default: per-user cache dir)")
+    c.set_defaults(func=cmd_cache)
     return parser
 
 

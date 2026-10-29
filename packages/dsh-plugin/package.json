@@ -1,6 +1,6 @@
 {
   "name": "dsh-embodied-data",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "DSH plugin + MCP server toolkit for embodied-AI data platforms: format detection, validation, quality control, segmentation, labeling tasks, conversion and cataloging for LeRobot, HDF5, RLDS, rosbag, MCAP and canonical JSONL datasets. Works with any MCP client (Codex, Claude Code, DeepSeek, Cursor, ...).",
   "type": "module",
   "main": "index.js",

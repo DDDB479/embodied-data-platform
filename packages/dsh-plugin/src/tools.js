@@ -93,7 +93,19 @@ export function buildToolDefinitions(tools, client, config, logger = console, ct
         const raw = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
         try {
           const input = await prepareToolCall({ ctx, tool, args: raw, exec, config, logger });
-          const data = await client.callTool(tool.name, input, { signal: exec.signal });
+          let lastLogged = -50;
+          const data = await client.callTool(tool.name, input, {
+            signal: exec.signal,
+            onProgress: (event) => {
+              // DSH has no dedicated progress channel here; log coarse
+              // milestones without flooding the transcript.
+              if (!logger?.info) return;
+              if (event.progress >= 100 || event.progress - lastLogged >= 50) {
+                lastLogged = event.progress;
+                logger.info(`embodied-data: ${tool.name} ${event.progress}%${event.message ? ` — ${event.message}` : ''}`);
+              }
+            },
+          });
           return { tool: tool.name, ok: true, data };
         } catch (error) {
           if (error && (error.code === 'ABORTED' || error.code === 'DISPOSED')) throw error;

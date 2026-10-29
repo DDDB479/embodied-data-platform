@@ -1,6 +1,6 @@
 # dsh-embodied-data
 
-DeepSeek Harness 插件：把 [embodied-data-studio](../../README.md) 的 13 个数据平台工具注册成原生 agent 工具，并注入使用它们的正确顺序。
+DeepSeek Harness 插件：把 [embodied-data-studio](../../README.md) 的 19 个 MCP 工具注册成原生 agent 工具，并注入使用它们的正确顺序。
 
 零依赖纯 ESM——不需要 `tsc`，不在 `node_modules` 里拉任何东西。JS 只做一件事：管理 `python -m embodied_core.mcp_server` 子进程并做 JSON-RPC 桥接。
 
@@ -22,6 +22,7 @@ node --test test/*.test.mjs                       # 路径、并发与审批单�
 | `embodied_summarize_dataset` | 特征表、episode 数、fps、机器人型号 |
 | `embodied_validate_dataset` | 8 组结构检查 + 0–100 分 |
 | `embodied_quality_report` | 逐特征统计 + 异常窗口 |
+| `embodied_quality_gate` | 可配置 fps/特征/分数/异常阈值质量门 |
 | `embodied_segment_episodes` | moving / idle 切段 |
 | `embodied_labeling_tasks` | 生成标注任务清单 |
 | `embodied_convert_dataset` | 转 canonical JSONL / LeRobot v2.1 |
@@ -29,8 +30,13 @@ node --test test/*.test.mjs                       # 路径、并发与审批单�
 | `embodied_catalog_index` | 扫描目录、增量编目 |
 | `embodied_catalog_search` | 按文本/格式/型号/episode 数/分数检索 |
 | `embodied_catalog_stats` | 编目汇总 |
+| `embodied_catalog_history` | 数据集版本、运行记录与谱系 |
 | `embodied_list_formats` | 支持的格式与检查项 |
 | `embodied_plan_windows` | 训练窗口规划 |
+| `embodied_submit_job` | 后台运行 quality_report / validate_dataset / quality_gate |
+| `embodied_job_status` | 查询进度、错误与最终结果 |
+| `embodied_cancel_job` | 协作式取消后台分析 |
+| `embodied_list_jobs` | 列出最近的后台作业 |
 
 ## 输出约定
 
@@ -41,6 +47,8 @@ node --test test/*.test.mjs                       # 路径、并发与审批单�
 - 只有 `annotations.readOnlyHint: true` 的 MCP 工具声明为 `isConcurrencySafe`；写工具保持 DSH 默认串行。
 - `convert_dataset` / `scaffold_project` / `catalog_index` / 带 `out` 的 `labeling_tasks` 在工作区外写入前调用 `approval.request`，只接受 `allowed-once`。
 - 没有审批服务、审批被拒绝或 DSH 为只读模式时，写入不会发生。
+- 异步作业只接受只读分析，不会绕过上述写入审批；`quality_report` 的缓存写入用户缓存目录，不写数据集或工作区。
+- MCP 客户端解析 `notifications/progress`；同步质检/校验按 50% 里程碑记日志，宿主也可订阅 `client.onProgress(...)`。
 
 ## 文件
 
@@ -48,7 +56,7 @@ node --test test/*.test.mjs                       # 路径、并发与审批单�
 index.js            apply(ctx, config)：注册工具 + 提示词 section
 cordis.patch.yml    bundle 声明
 src/config.js       解释器/PYTHONPATH 解析
-src/mcp.js          MCP stdio 客户端（spawn、分帧、超时、重启）
+src/mcp.js          MCP stdio 客户端（spawn、分帧、超时、重启、进度通知）
 src/tools.js        MCP 工具 → Harness 工具
 src/prompt.js       工作流与约定提示词
 scripts/probe.mjs   mock ctx 的端到端自检

@@ -1,74 +1,39 @@
-"""CI quality gate: fail the build when a dataset would poison training.
+"""CI quality gate using the configurable rule engine.
 
-    python examples/quality_gate.py /data/datasets/night_run
+    python examples/quality_gate.py /data/datasets/night_run examples/quality_rules.json
 
-Exit codes: 0 pass, 1 reject, 2 usage error. Wire it into a pipeline exactly
-like a linter, or call the same three functions from your ingest service.
+Exit codes: 0 pass, 1 reject, 2 usage/rule error. The same rules can be used by
+`embodied gate` or the `quality_gate` MCP tool.
 """
 from __future__ import annotations
 
+import json
 import sys
-from pathlib import Path
 
-from embodied_core import open_dataset, validate
-from embodied_core.quality import detect_anomalies, signal_features
-
-MIN_SCORE = 80
-MAX_FORBIDDEN_WINDOWS = 3
-
-
-def gate(path: Path) -> tuple[bool, list[str]]:
-    reasons: list[str] = []
-
-    report = validate(path)
-    if report["format"] is None:
-        return False, [f"not a dataset: {path}"]
-    if report["errors"]:
-        reasons.append(f"{report['errors']} error-level issues")
-    if report["score"] < MIN_SCORE:
-        reasons.append(f"score {report['score']} < {MIN_SCORE}")
-
-    dataset = open_dataset(path)
-    summary = dataset.summary
-    try:
-        if not summary.features:
-            reasons.append("no features declared")
-        keys = {feature.key for feature in summary.features}
-        for required in ("observation.state", "action"):
-            if required not in keys:
-                reasons.append(f"missing required feature {required}")
-
-        if not reasons:
-            try:
-                ids, columns = dataset.frames()
-            except Exception as exc:  # frames are optional for some formats
-                print(f"note: frame scan skipped ({exc})")
-            else:
-                windows = detect_anomalies(ids, columns, fps=summary.fps)
-                fatal = [w for w in windows if w["code"] in {"non_finite", "jump"}]
-                if len(fatal) > MAX_FORBIDDEN_WINDOWS:
-                    reasons.append(f"{len(fatal)} discontinuity windows (limit {MAX_FORBIDDEN_WINDOWS})")
-                print(
-                    f"scanned {len(signal_features(columns))} signal columns: "
-                    f"{len(windows)} windows, {len(fatal)} discontinuities"
-                )
-    finally:
-        dataset.close()
-
-    return not reasons, reasons
+from embodied_core import evaluate_quality_gate
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print("usage: quality_gate.py <dataset>", file=sys.stderr)
+    args = [value for value in argv[1:] if value != "--json"]
+    as_json = "--json" in argv[1:]
+    if not args:
+        print("usage: quality_gate.py <dataset> [rules.json|rules.toml]", file=sys.stderr)
         return 2
-    ok, reasons = gate(Path(argv[1]))
-    if ok:
-        print(f"PASS {argv[1]}")
+    try:
+        report = evaluate_quality_gate(args[0], rules=args[1] if len(args) > 1 else None)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if report["ok"]:
+        print(f"PASS {args[0]} score={report['score']}")
+        if as_json:
+            print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
-    print(f"REJECT {argv[1]}", file=sys.stderr)
-    for reason in reasons:
-        print(f"  - {reason}", file=sys.stderr)
+    print(f"REJECT {args[0]} score={report['score']}", file=sys.stderr)
+    for failure in report["gate"]["failures"]:
+        print(f"  [{failure['code']}] {failure['message']}", file=sys.stderr)
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
     return 1
 
 

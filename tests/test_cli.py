@@ -25,6 +25,7 @@ class CliTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.dataset = support.write_jsonl_dataset(self.root / "canonical")
+        self.cache = self.root / "quality-cache.sqlite3"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -67,7 +68,7 @@ class CliTestCase(unittest.TestCase):
         self.assertIn("format.unsupported", {issue["code"] for issue in payload["issues"]})
 
     def test_quality_reports_anomalies(self) -> None:
-        code, output = _run("quality", str(self.dataset), "--json")
+        code, output = _run("quality", str(self.dataset), "--cache-path", str(self.cache), "--json")
         self.assertEqual(code, 0)
         payload = json.loads(output)
         self.assertIn("stats", payload)
@@ -75,6 +76,46 @@ class CliTestCase(unittest.TestCase):
         # Bookkeeping columns must not be reported as robot signals.
         self.assertNotIn("episode_index", payload["stats"])
         self.assertTrue(all(window["feature"] not in {"episode_index", "frame_index"} for window in payload["anomalies"]))
+
+    def test_quality_cache_hit_and_management(self) -> None:
+        code, first = _run("quality", str(self.dataset), "--cache-path", str(self.cache), "--json")
+        self.assertEqual(code, 0)
+        self.assertFalse(json.loads(first)["cache"]["hit"])
+        code, second = _run("quality", str(self.dataset), "--cache-path", str(self.cache), "--json")
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(second)["cache"]["hit"])
+
+        code, output = _run("cache", "stats", "--path", str(self.cache))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["entries"], 1)
+        code, output = _run("cache", "clear", "--path", str(self.cache))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["cleared"], 1)
+
+    def test_gate_json_and_exit_code(self) -> None:
+        code, output = _run("gate", str(self.dataset), "--expected-fps", "30", "--json")
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(output)["ok"])
+        code, output = _run("gate", str(self.dataset), "--expected-fps", "60", "--json")
+        self.assertEqual(code, 1)
+        payload = json.loads(output)
+        self.assertIn("gate.fps_mismatch", {item["code"] for item in payload["gate"]["failures"]})
+
+    def test_quality_chunk_options_are_exposed(self) -> None:
+        code, output = _run(
+            "quality",
+            str(self.dataset),
+            "--chunk-frames",
+            "7",
+            "--max-frames",
+            "0",
+            "--no-cache",
+            "--json",
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertGreater(payload["scan"]["chunks"], 1)
+        self.assertEqual(payload["scan"]["frames_scanned"], 60)
 
     def test_segment_json(self) -> None:
         code, output = _run("segment", str(self.dataset), "--json")
@@ -129,6 +170,12 @@ class CliTestCase(unittest.TestCase):
         code, output = _run("catalog", "stats", "--db", str(db), "--json")
         self.assertEqual(code, 0)
         self.assertGreaterEqual(json.loads(output)["total_datasets"], 1)
+        code, output = _run("catalog", "versions", "--db", str(db), "--json")
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(json.loads(output)["count"], 1)
+        code, output = _run("catalog", "history", "--db", str(db), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["schema_version"], 2)
 
     def test_checks_command(self) -> None:
         code, output = _run("checks", "--json")

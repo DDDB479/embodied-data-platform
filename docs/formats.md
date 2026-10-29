@@ -12,7 +12,7 @@
 | `rlds` | `dataset_info.json` / `features.json` + shards | `tensorflow`（解码 example proto） | ❌ | TFDS 生态、Open X-Embodiment |
 | `embodied-jsonl` | `dataset.json` 的 format 标记，或 JSONL episode 行 | 无 | ✅ | 本工具链的 canonical 交换格式 |
 
-"能读帧"= `dataset.frames()` 返回 `(ids, dict[str, 2D ndarray])`，可以把数值列交给质量分析与转换。"不能"= 抛 `FramesUnavailable(reason, install)`，但**元数据级能力照常**：识别、统计 episode/消息数、校验、编目都能用。
+"能读帧"= `dataset.frames()` 返回 `(ids, dict[str, 2D ndarray])`，可以把数值列交给质量分析与转换。大文件优先用 `dataset.iter_frames(chunk_frames=...)`，它产出带 `offsets` 的 `FrameChunk`，并受 `max_frames` / `EMBODIED_MAX_FRAMES` 上限保护。"不能"= 抛 `FramesUnavailable(reason, install)`，但**元数据级能力照常**：识别、统计 episode/消息数、校验、编目都能用。
 
 为什么 MCAP / rosbag / RLDS 读不了帧：这些格式里的"帧"要先按 schema 解码（ROS 的 `sensor_msgs/Image`、CDR 编码、TFRecord 的 Example proto）。硬解码会把工具链绑死在某个 SDK 的版本上，所以这里显式划界——需要逐帧时请先转成 LeRobot/HDF5，或者写一个项目内的解码器。
 

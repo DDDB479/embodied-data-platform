@@ -15,7 +15,7 @@ import statistics
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-from .formats.base import DatasetObject, FramesUnavailable
+from .formats.base import DatasetObject, FrameLimitExceeded, FramesUnavailable
 from .model import DatasetSummary, Issue, Severity, summarize_issues
 from .registry import UnsupportedFormat, detect_dataset, open_dataset
 
@@ -399,13 +399,23 @@ CHECKS: dict[str, CheckFn] = {
 DEFAULT_CHECKS = [name for name in CHECKS if name not in {"parquet"}]
 
 
-def run_checks(dataset: DatasetObject, checks: Sequence[str] | None = None) -> list[Issue]:
+def run_checks(
+    dataset: DatasetObject,
+    checks: Sequence[str] | None = None,
+    *,
+    progress: Callable[[float, str], None] | None = None,
+) -> list[Issue]:
     names = list(checks or DEFAULT_CHECKS)
     unknown = [name for name in names if name not in CHECKS]
     if unknown:
         raise KeyError(f"unknown checks: {unknown}; available: {sorted(CHECKS)}")
     issues: list[Issue] = []
-    for name in names:
+    total = max(len(names), 1)
+    for position, name in enumerate(names):
+        # Cancellation (raised from the callback) must not be swallowed by the
+        # per-check guard below.
+        if progress is not None:
+            progress(position / total * 100.0, f"running {name}")
         try:
             issues.extend(CHECKS[name](dataset) or [])
         except Exception as exc:  # a failing check is reported, not fatal
@@ -416,6 +426,8 @@ def run_checks(dataset: DatasetObject, checks: Sequence[str] | None = None) -> l
                     message=f"check {name!r} raised {type(exc).__name__}: {exc}",
                 )
             )
+    if progress is not None:
+        progress(100.0, "checks complete")
     return issues
 
 
@@ -425,11 +437,16 @@ def validate(
     format: str | None = None,
     checks: Sequence[str] | None = None,
     include_frames: bool = False,
+    progress: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     """Validate a dataset and return a JSON-ready report."""
+    if progress is not None:
+        progress(2.0, "opening dataset")
     try:
         dataset = open_dataset(path, format)
     except UnsupportedFormat as exc:
+        if progress is not None:
+            progress(100.0, "unsupported format")
         return {
             "path": str(path),
             "ok": False,
@@ -438,8 +455,15 @@ def validate(
             "counts": summarize_issues([Issue(code="format.unsupported", severity=Severity.ERROR, message=str(exc))]),
         }
     try:
-        issues = run_checks(dataset, checks)
+        check_progress = None
+        if progress is not None:
+            check_progress = lambda value, message: progress(
+                10.0 + value * (75.0 if include_frames else 88.0) / 100.0, message
+            )
+        issues = run_checks(dataset, checks, progress=check_progress)
         if include_frames:
+            if progress is not None:
+                progress(88.0, "scanning frames")
             issues.extend(_frame_checks(dataset))
         counts = summarize_issues(issues)
         report: dict[str, Any] = {
@@ -458,16 +482,27 @@ def validate(
             pass
         if detection:
             report["detection"] = detection
+        if progress is not None:
+            progress(100.0, "completed")
         return report
     finally:
         dataset.close()
 
 
 def _frame_checks(dataset: DatasetObject) -> list[Issue]:
-    from .quality import basic_issue_scan
+    from .quality import compute_feature_stats, issues_from_stats, merge_feature_stats
 
     try:
-        _, columns = dataset.frames()
+        parts = [compute_feature_stats(chunk.columns) for chunk in dataset.iter_frames()]
     except FramesUnavailable as exc:
         return [Issue(code="frames.unavailable", severity=Severity.INFO, message=exc.reason)]
-    return basic_issue_scan(columns)
+    except FrameLimitExceeded as exc:
+        return [
+            Issue(
+                code="frames.limit_exceeded",
+                severity=Severity.ERROR,
+                message=str(exc),
+                hint=exc.hint,
+            )
+        ]
+    return issues_from_stats(merge_feature_stats(parts))

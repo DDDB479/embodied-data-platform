@@ -198,7 +198,7 @@ class MCAPDataset(DatasetObject):
     def optional_dependencies() -> dict[str, str]:
         return {"mcap": "full MCAP reading (fallback reader is built in)"}
 
-    def frames(self, episodes=None, features=None):  # noqa: ANN001 - protocol signature
+    def frames(self, episodes=None, features=None, *, max_frames=None):  # noqa: ANN001 - protocol signature
         raise FramesUnavailable("MCAP stores message streams; decode topics with their ROS/CDR schema first")
 
 

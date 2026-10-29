@@ -68,24 +68,31 @@ embodied quality "$DATA" --json > quality.json
 embodied segment "$DATA"                    # 按运动量切 moving / idle
 embodied label "$DATA" --out tasks.json     # 生成标注任务清单
 
-# 3) 转换：只有通过质量门的样本才进训练集
+# 3) 可配置质量门：期望 fps、必需特征、分数/NaN/异常阈值
+embodied gate "$DATA" --rules rules.json
+
+# 4) 转换：只有通过质量门的样本才进训练集
 embodied convert "$DATA" ./out/lerobot --target lerobot
 
-# 4) 编目，供后续检索
+# 5) 编目，供后续检索；版本/运行/谱系可追溯
 embodied catalog index ./datasets --db catalog.db
 embodied catalog search --db catalog.db --min-score 80 --min-episodes 20
+embodied catalog history --db catalog.db --path "$DATA"
 ```
 
 同一个流程在 Python 里：
 
 ```python
-from embodied_core import open_dataset, validate, convert
+from embodied_core import evaluate_quality_gate, open_dataset, validate, convert
 from embodied_core.quality import detect_anomalies, segment_by_motion, build_labeling_tasks
 
 path = "./datasets/aloha_pick_cube"
 report = validate(path)
 if report["score"] < 80 or report["errors"]:
     raise SystemExit(f"rejected: {report['score']} / {report['errors']} errors")
+gate = evaluate_quality_gate(path, rules={"expected_fps": 30, "required_features": ["observation.state", "action"]})
+if not gate["ok"]:
+    raise SystemExit(f"gate rejected: {gate['gate']['failures']}")
 
 dataset = open_dataset(path)
 ids, columns = dataset.frames()

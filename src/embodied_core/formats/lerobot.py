@@ -28,9 +28,14 @@ from ..model import DatasetSummary, EpisodeRecord, FeatureSpec
 from .base import (
     DatasetObject,
     Detection,
+    FrameChunk,
+    FrameLimitExceeded,
     FramesUnavailable,
+    collect_frame_chunks,
     episode_records_from_lengths,
     guess_kind,
+    resolve_chunk_frames,
+    resolve_max_frames,
     to_numeric,
 )
 
@@ -250,67 +255,77 @@ class LeRobotDataset(DatasetObject):
         self,
         episodes: Sequence[int] | None = None,
         features: Sequence[str] | None = None,
+        *,
+        max_frames: int | None = None,
     ) -> tuple[list[int], dict[str, np.ndarray]]:
+        return collect_frame_chunks(
+            self.iter_frames(episodes, features, max_frames=max_frames),
+            max_frames=max_frames,
+        )
+
+    def iter_frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        chunk_frames: int | None = None,
+        max_frames: int | None = None,
+    ) -> Iterator[FrameChunk]:
         pq = _pyarrow()
         wanted = set(episodes) if episodes is not None else None
-        chunks: list[Any] = []
+        keep = set(features) if features else None
+        size = resolve_chunk_frames(chunk_frames)
+        limit = resolve_max_frames(max_frames)
+        total = 0
+        seen: dict[int, int] = {}
+        emitted = False
         for path in _parquet_paths(self.root):
             match = _EPISODE_FILE.search(path.name)
             file_episode = int(match.group(1)) if match else None
             if file_episode is not None and wanted is not None and file_episode not in wanted:
                 continue
-            table = pq.read_table(path)
-            names = [n for n in table.column_names if n not in ("episode_index",) or True]
-            arrays: dict[str, Any] = {}
-            for name in names:
-                column = table.column(name)
-                if str(column.type) in ("string", "large_string", "bool"):
+            parquet = pq.ParquetFile(path)
+            for batch in parquet.iter_batches(batch_size=size):
+                table = batch
+                arrays: dict[str, np.ndarray] = {}
+                for name in table.column_names:
+                    if name in _INDEX_COLUMNS:
+                        continue
+                    if keep is not None and name not in keep:
+                        continue
+                    column = table.column(name)
+                    if str(column.type) in ("string", "large_string", "bool"):
+                        continue
+                    try:
+                        numeric = to_numeric(column.to_pylist())
+                    except Exception:
+                        continue
+                    if numeric is not None:
+                        arrays[name] = numeric
+                if not arrays:
                     continue
-                try:
-                    data = column.to_pylist()
-                except Exception:
-                    continue
-                numeric = to_numeric(data)
-                if numeric is not None:
-                    arrays[name] = numeric
-            if not arrays:
-                continue
-            if "episode_index" in table.column_names:
-                ep_values = np.asarray(table.column("episode_index").to_pylist(), dtype=np.int64)
-            else:
-                ep_values = np.full(len(next(iter(arrays.values()))), -1 if file_episode is None else file_episode, dtype=np.int64)
-            chunks.append((ep_values, arrays))
-        if not chunks:
+                index_name = next((name for name in _INDEX_COLUMNS if name in table.column_names), None)
+                if index_name is not None:
+                    ep_values = np.asarray(table.column(index_name).to_pylist(), dtype=np.int64)
+                else:
+                    ep_values = np.full(len(next(iter(arrays.values()))), -1 if file_episode is None else file_episode, dtype=np.int64)
+                if wanted is not None:
+                    mask = np.isin(ep_values, list(wanted))
+                    if not mask.any():
+                        continue
+                    ep_values = ep_values[mask]
+                    arrays = {key: value[mask] for key, value in arrays.items()}
+                total += len(ep_values)
+                if limit and total > limit:
+                    raise FrameLimitExceeded(limit, total)
+                ids = ep_values.tolist()
+                offsets = {episode: seen.get(episode, 0) for episode in dict.fromkeys(ids)}
+                for episode in ids:
+                    seen[episode] = seen.get(episode, 0) + 1
+                emitted = True
+                yield FrameChunk(ids, arrays, offsets)
+        if not emitted:
             raise FramesUnavailable("no readable parquet data found under data/")
-
-        merged: dict[str, list[np.ndarray]] = defaultdict(list)
-        ep_parts: list[np.ndarray] = []
-        for ep_values, arrays in chunks:
-            ep_parts.append(ep_values)
-            for key, value in arrays.items():
-                merged[key].append(value)
-        ep_all = np.concatenate(ep_parts)
-        columns: dict[str, np.ndarray] = {}
-        for key, parts in merged.items():
-            try:
-                columns[key] = np.concatenate(parts, axis=0)
-            except ValueError:
-                continue
-        if "episode_index" in columns:
-            ep_all = columns.pop("episode_index").astype(np.int64).ravel()
-        if features:
-            keep = set(features)
-            columns = {k: v for k, v in columns.items() if k in keep or k in ("timestamp", "frame_index")}
-        order = np.argsort(ep_all, kind="stable")
-        ep_all = ep_all[order]
-        columns = {k: v[order] for k, v in columns.items()}
-        if wanted is not None:
-            mask = np.isin(ep_all, list(wanted))
-            ep_all = ep_all[mask]
-            columns = {k: v[mask] for k, v in columns.items()}
-        # `ids` is per frame (same length as the columns), matching every other
-        # adapter: consumers use it to slice contiguous same-episode runs.
-        return ep_all.tolist(), columns
 
 
 def load(root: Path, detection: Detection | None = None) -> LeRobotDataset:

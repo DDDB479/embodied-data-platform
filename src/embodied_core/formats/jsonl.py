@@ -24,10 +24,21 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from ..model import DatasetSummary, EpisodeRecord, FeatureSpec
-from .base import DatasetObject, Detection, FramesUnavailable, guess_kind, to_numeric
+from .base import (
+    DatasetObject,
+    Detection,
+    FrameChunk,
+    FrameLimitExceeded,
+    FramesUnavailable,
+    collect_frame_chunks,
+    guess_kind,
+    resolve_chunk_frames,
+    resolve_max_frames,
+    to_numeric,
+)
 
 HEADER_KEY = "__header__"
 FORMAT = "embodied-jsonl"
@@ -82,7 +93,6 @@ def detect(root: Path) -> Detection | None:
 class JSONLDataset(DatasetObject):
     def __init__(self, root: Path, summary: DatasetSummary) -> None:
         super().__init__(root, summary, capabilities={"frames", "episodes"})
-        self._episodes: dict[int, dict[str, Any]] = {}
 
     def rows(self, episodes=None, features=None) -> tuple[list[int], list[dict[str, Any]]]:
         """Raw per-frame objects, preserving non-numeric values such as strings."""
@@ -90,47 +100,122 @@ class JSONLDataset(DatasetObject):
         feature_filter = set(features) if features else None
         ids: list[int] = []
         rows: list[dict[str, Any]] = []
-        for index in sorted(self._episodes):
-            if wanted is not None and index not in wanted:
-                continue
-            episode = self._episodes[index]
-            columns = episode.get("columns")
-            frame_rows: list[dict[str, Any]] = []
-            if isinstance(columns, dict):
-                length = max((len(v) for v in columns.values() if isinstance(v, list)), default=0)
-                for position in range(length):
-                    frame_rows.append(
-                        {
-                            key: values[position]
-                            for key, values in columns.items()
-                            if isinstance(values, list) and position < len(values)
-                        }
-                    )
-            else:
-                frame_rows = [row for row in (episode.get("frames") or []) if isinstance(row, dict)]
-            for row in frame_rows:
-                ids.append(index)
-                rows.append(_filter_row(row, feature_filter))
+        ordinal = 0
+        for path in _jsonl_files(self.root):
+            for line_no, payload in enumerate(_read_lines(path), 1):
+                if isinstance(payload, dict) and payload.get(HEADER_KEY):
+                    continue
+                episode = _episode_rows(payload, line_no)
+                index = int(episode.get("episode_index", ordinal))
+                ordinal += 1
+                if wanted is not None and index not in wanted:
+                    continue
+                for row in _frame_rows(episode):
+                    ids.append(index)
+                    rows.append(_filter_row(row, feature_filter))
         if not rows:
             raise FramesUnavailable("no frames matched the request")
         return ids, rows
 
-    def frames(self, episodes=None, features=None):  # noqa: ANN001
-        import numpy as np
+    def iter_frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        chunk_frames: int | None = None,
+        max_frames: int | None = None,
+    ) -> Iterator[FrameChunk]:
+        wanted = set(episodes) if episodes is not None else None
+        feature_filter = set(features) if features else None
+        size = resolve_chunk_frames(chunk_frames)
+        limit = resolve_max_frames(max_frames)
+        total = 0
+        seen: dict[int, int] = {}
+        chunk_ids: list[int] = []
+        chunk_rows: list[dict[str, Any]] = []
+        emitted = False
+        ordinal = 0
 
-        ids, rows = self.rows(episodes, features)
-        keys = [f.key for f in self.summary.features]
-        if features:
-            keep = [k for k in keys if k in set(features)]
-        else:
-            keep = keys
-        columns: dict[str, Any] = {}
-        for key in keep:
-            values = [row.get(key) for row in rows]
-            numeric = to_numeric(values)
-            if numeric is not None:
-                columns[key] = numeric
-        return ids, columns
+        def flush() -> FrameChunk | None:
+            nonlocal chunk_ids, chunk_rows, emitted
+            if not chunk_ids:
+                return None
+            columns = _numeric_columns(chunk_rows, features)
+            offsets = {episode: seen.get(episode, 0) for episode in dict.fromkeys(chunk_ids)}
+            for episode in chunk_ids:
+                seen[episode] = seen.get(episode, 0) + 1
+            chunk = FrameChunk(chunk_ids, columns, offsets) if columns else None
+            chunk_ids = []
+            chunk_rows = []
+            if chunk is not None:
+                emitted = True
+            return chunk
+
+        for path in _jsonl_files(self.root):
+            for line_no, payload in enumerate(_read_lines(path), 1):
+                if isinstance(payload, dict) and payload.get(HEADER_KEY):
+                    continue
+                episode = _episode_rows(payload, line_no)
+                index = int(episode.get("episode_index", ordinal))
+                ordinal += 1
+                if wanted is not None and index not in wanted:
+                    continue
+                for row in _frame_rows(episode):
+                    total += 1
+                    if limit and total > limit:
+                        raise FrameLimitExceeded(limit, total)
+                    chunk_ids.append(index)
+                    chunk_rows.append(_filter_row(row, feature_filter))
+                    if len(chunk_ids) >= size:
+                        chunk = flush()
+                        if chunk is not None:
+                            yield chunk
+        chunk = flush()
+        if chunk is not None:
+            yield chunk
+        if not emitted:
+            raise FramesUnavailable("no numeric frames matched the request")
+
+    def frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        max_frames: int | None = None,
+    ) -> tuple[list[int], dict[str, Any]]:
+        return collect_frame_chunks(
+            self.iter_frames(episodes, features, max_frames=max_frames),
+            max_frames=max_frames,
+        )
+
+
+def _frame_rows(episode: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    columns = episode.get("columns")
+    if isinstance(columns, dict):
+        length = max((len(v) for v in columns.values() if isinstance(v, list)), default=0)
+        for position in range(length):
+            yield {
+                key: values[position]
+                for key, values in columns.items()
+                if isinstance(values, list) and position < len(values)
+            }
+        return
+    for row in episode.get("frames") or []:
+        if isinstance(row, dict):
+            yield row
+
+
+def _numeric_columns(rows: list[dict[str, Any]], features: Sequence[str] | None) -> dict[str, Any]:
+    keep = set(features) if features else None
+    columns: dict[str, Any] = {}
+    keys = {key for row in rows for key in row}
+    for key in sorted(keys):
+        if keep is not None and key not in keep:
+            continue
+        numeric = to_numeric([row.get(key) for row in rows])
+        if numeric is not None:
+            columns[key] = numeric
+    return columns
 
 
 def _filter_row(row: dict[str, Any], keep: set[str] | None) -> dict[str, Any]:
@@ -209,8 +294,9 @@ def load(root: Path, detection: Detection | None = None) -> JSONLDataset:
         except (OSError, json.JSONDecodeError) as exc:
             notes.append(f"dataset.json unreadable: {exc}")
 
-    episodes: list[dict[str, Any]] = []
-    index_map: dict[int, dict[str, Any]] = {}
+    samples: list[dict[str, Any]] = []
+    records: list[EpisodeRecord] = []
+    ordinal = 0
     for path in files:
         for line_no, payload in enumerate(_read_lines(path), 1):
             if isinstance(payload, dict) and payload.get(HEADER_KEY):
@@ -219,30 +305,38 @@ def load(root: Path, detection: Detection | None = None) -> JSONLDataset:
                 declared = declared or (payload.get("features") or {})
                 continue
             row = _episode_rows(payload, line_no)
-            index = int(row.get("episode_index", len(episodes)))
-            row.setdefault("episode_index", index)
-            episodes.append(row)
-            index_map[index] = row
-
-    features = _infer_features(episodes, declared)
-    records: list[EpisodeRecord] = []
-    for row in episodes:
-        index = int(row["episode_index"])
-        frames = row.get("frames")
-        columns = row.get("columns")
-        length = len(frames) if isinstance(frames, list) else (max((len(v) for v in columns.values() if isinstance(v, list)), default=0) if isinstance(columns, dict) else None)
-        fps = row.get("fps") or meta.get("fps")
-        duration = (length / float(fps)) if (length and fps) else None
-        records.append(
-            EpisodeRecord(
-                index=index,
-                length=length,
-                task=row.get("task"),
-                duration_s=duration,
-                fps=float(fps) if fps else None,
-                meta={k: v for k, v in row.items() if k not in {"frames", "columns", "episode_index", "task"}},
+            index = int(row.get("episode_index", ordinal))
+            ordinal += 1
+            frames = row.get("frames")
+            columns = row.get("columns")
+            length = len(frames) if isinstance(frames, list) else (
+                max((len(v) for v in columns.values() if isinstance(v, list)), default=0)
+                if isinstance(columns, dict)
+                else None
             )
-        )
+            fps = row.get("fps") or meta.get("fps")
+            duration = (length / float(fps)) if (length and fps) else None
+            records.append(
+                EpisodeRecord(
+                    index=index,
+                    length=length,
+                    task=row.get("task"),
+                    duration_s=duration,
+                    fps=float(fps) if fps else None,
+                    meta={k: v for k, v in row.items() if k not in {"frames", "columns", "episode_index", "task"}},
+                )
+            )
+            if len(samples) < 8:
+                sample = {k: v for k, v in row.items() if k not in {"frames", "columns"}}
+                if isinstance(frames, list):
+                    sample["frames"] = frames[:4]
+                if isinstance(columns, dict):
+                    sample["columns"] = {
+                        key: value[:8] if isinstance(value, list) else value for key, value in columns.items()
+                    }
+                samples.append(sample)
+
+    features = _infer_features(samples, declared)
     if not records:
         notes.append("no episode lines found")
 
@@ -263,5 +357,4 @@ def load(root: Path, detection: Detection | None = None) -> JSONLDataset:
         sources=[p.name for p in files],
     )
     dataset = JSONLDataset(root, summary)
-    dataset._episodes = index_map
     return dataset

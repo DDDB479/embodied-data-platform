@@ -4,9 +4,12 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 from embodied_core import mcp_server
 
 from tests import support
@@ -45,7 +48,7 @@ class McpProtocolTestCase(unittest.TestCase):
 
     def test_tools_list_shape(self) -> None:
         result = _rpc("tools/list")["result"]
-        self.assertEqual(len(result["tools"]), 13)
+        self.assertEqual(len(result["tools"]), 19)
         for tool in result["tools"]:
             self.assertIn("name", tool)
             self.assertIn("description", tool)
@@ -58,6 +61,10 @@ class McpProtocolTestCase(unittest.TestCase):
         by_name = {tool["name"]: tool for tool in result["tools"]}
         self.assertTrue(by_name["list_formats"]["annotations"]["readOnlyHint"])
         self.assertFalse(by_name["convert_dataset"]["annotations"]["readOnlyHint"])
+        self.assertIn("submit_job", by_name)
+        self.assertIn("job_status", by_name)
+        self.assertIn("quality_gate", by_name)
+        self.assertIn("catalog_history", by_name)
 
     def test_unknown_method_is_an_error(self) -> None:
         response = _rpc("does/not/exist")
@@ -80,8 +87,13 @@ class McpToolTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.dataset = support.write_jsonl_dataset(self.root / "canonical")
+        self._cache_env = mock.patch.dict(
+            os.environ, {"EMBODIED_QUALITY_CACHE": str(self.root / "default-quality-cache.sqlite3")}
+        )
+        self._cache_env.start()
 
     def tearDown(self) -> None:
+        self._cache_env.stop()
         self._tmp.cleanup()
 
     def test_detect_and_summarize(self) -> None:
@@ -147,6 +159,12 @@ class McpToolTestCase(unittest.TestCase):
         self.assertFalse(failed)
         self.assertGreaterEqual(stats["total_datasets"], 1)
 
+        failed, history = _call("catalog_history", {"db": str(db)})
+        self.assertFalse(failed)
+        self.assertEqual(history["schema_version"], 2)
+        self.assertTrue(history["versions"])
+        self.assertTrue(history["runs"])
+
     def test_list_formats(self) -> None:
         failed, payload = _call("list_formats", {})
         self.assertFalse(failed)
@@ -159,6 +177,107 @@ class McpToolTestCase(unittest.TestCase):
         )
         self.assertFalse(failed)
         self.assertTrue(result["files"])
+
+    def test_quality_progress_notifications(self) -> None:
+        cache = self.root / "quality-cache.sqlite3"
+        events: list[dict] = []
+        with mock.patch.dict(os.environ, {"EMBODIED_QUALITY_CACHE": str(cache)}):
+            response = mcp_server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "quality_report",
+                        "arguments": {"path": str(self.dataset)},
+                        "_meta": {"progressToken": "quality-1"},
+                    },
+                },
+                emit=events.append,
+            )
+        self.assertFalse(response["result"]["isError"])
+        progress = [event for event in events if event.get("method") == "notifications/progress"]
+        self.assertTrue(progress)
+        self.assertTrue(all(item["params"]["progressToken"] == "quality-1" for item in progress))
+        self.assertEqual(progress[-1]["params"]["progress"], 100.0)
+
+    def test_async_job_round_trip(self) -> None:
+        cache = self.root / "quality-cache.sqlite3"
+        events: list[dict] = []
+        with mock.patch.dict(os.environ, {"EMBODIED_QUALITY_CACHE": str(cache)}):
+            submitted = mcp_server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "submit_job",
+                        "arguments": {"tool": "quality_report", "arguments": {"path": str(self.dataset)}},
+                        "_meta": {"progressToken": "async-1"},
+                    },
+                },
+                emit=events.append,
+            )
+            payload = json.loads(submitted["result"]["content"][0]["text"])
+            job_id = payload["job"]["job_id"]
+            deadline = time.time() + 10
+            status = {}
+            while time.time() < deadline:
+                failed, status = _call("job_status", {"job_id": job_id})
+                self.assertFalse(failed)
+                if status["status"] in {"succeeded", "failed", "cancelled"}:
+                    break
+                time.sleep(0.02)
+        self.assertEqual(status.get("status"), "succeeded", status)
+        failed, complete = _call("job_status", {"job_id": job_id, "include_result": True})
+        self.assertFalse(failed)
+        self.assertIn("observation.state", complete["result"]["stats"])
+        progress = [event for event in events if event.get("method") == "notifications/progress"]
+        self.assertTrue(progress)
+        self.assertTrue(all(item["params"]["progressToken"] == "async-1" for item in progress))
+
+    def test_async_job_rejects_write_tools(self) -> None:
+        failed, payload = _call(
+            "submit_job",
+            {"tool": "convert_dataset", "arguments": {"source": str(self.dataset), "destination": str(self.root / "out")}},
+        )
+        self.assertTrue(failed)
+        self.assertEqual(payload["error"]["code"], "bad_arguments")
+
+    def test_quality_gate_is_available_as_an_async_job(self) -> None:
+        submitted = mcp_server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "submit_job",
+                    "arguments": {
+                        "tool": "quality_gate",
+                        "arguments": {"path": str(self.dataset), "rules": {"expected_fps": 30, "use_cache": False}},
+                    },
+                },
+            }
+        )
+        payload = json.loads(submitted["result"]["content"][0]["text"])
+        job_id = payload["job"]["job_id"]
+        deadline = time.time() + 10
+        status = {}
+        while time.time() < deadline:
+            failed, status = _call("job_status", {"job_id": job_id})
+            self.assertFalse(failed)
+            if status["status"] in {"succeeded", "failed", "cancelled"}:
+                break
+            time.sleep(0.02)
+        self.assertEqual(status.get("status"), "succeeded", status)
+        failed, complete = _call("job_status", {"job_id": job_id, "include_result": True})
+        self.assertFalse(failed)
+        self.assertTrue(complete["result"]["gate"]["passed"])
+
+    def test_unknown_job_is_structured(self) -> None:
+        failed, payload = _call("job_status", {"job_id": "job_missing"})
+        self.assertTrue(failed)
+        self.assertEqual(payload["error"]["code"], "job_not_found")
 
     # ---- error codes -------------------------------------------------
     def test_missing_path_is_not_found(self) -> None:

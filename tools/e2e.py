@@ -118,6 +118,19 @@ def t_quality():
     return f"nan_ratio={stats['observation.state']['nan_ratio']:.3f} windows={len(windows)}"
 
 
+def t_quality_cache():
+    from embodied_core.reports import quality_report
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp) / "quality-cache.sqlite3"
+        first = quality_report(FIXTURES / "canonical", cache_path=cache)
+        second = quality_report(FIXTURES / "canonical", cache_path=cache)
+        assert first["cache"]["hit"] is False, first["cache"]
+        assert second["cache"]["hit"] is True, second["cache"]
+        assert second["cache"]["hits"] == 1, second["cache"]
+    return "miss -> hit"
+
+
 def t_segment():
     dataset = open_dataset(FIXTURES / "canonical")
     ids, columns = dataset.frames([0])
@@ -138,6 +151,83 @@ def t_label():
     dataset.close()
     assert manifest["task_count"] >= 1, manifest
     return f"tasks={manifest['task_count']}"
+
+
+def t_async_jobs():
+    import time
+
+    from embodied_core import mcp_server
+
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = os.environ.get("EMBODIED_QUALITY_CACHE")
+        os.environ["EMBODIED_QUALITY_CACHE"] = str(Path(tmp) / "quality-cache.sqlite3")
+        events = []
+        try:
+            response = mcp_server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "submit_job",
+                        "arguments": {"tool": "quality_report", "arguments": {"path": str(FIXTURES / "canonical")}},
+                        "_meta": {"progressToken": "e2e-job"},
+                    },
+                },
+                emit=events.append,
+            )
+            submitted = json.loads(response["result"]["content"][0]["text"])
+            job_id = submitted["job"]["job_id"]
+            deadline = time.time() + 30
+            status = {}
+            while time.time() < deadline:
+                status_response = mcp_server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 100,
+                        "method": "tools/call",
+                        "params": {"name": "job_status", "arguments": {"job_id": job_id, "include_result": True}},
+                    }
+                )
+                status = json.loads(status_response["result"]["content"][0]["text"])
+                if status["status"] in {"succeeded", "failed", "cancelled"}:
+                    break
+                time.sleep(0.05)
+            assert status["status"] == "succeeded", status
+            assert "observation.state" in status["result"]["stats"], status["result"]
+            progress = [event for event in events if event.get("method") == "notifications/progress"]
+            assert progress, events
+            assert all(item["params"]["progressToken"] == "e2e-job" for item in progress)
+        finally:
+            if previous is None:
+                os.environ.pop("EMBODIED_QUALITY_CACHE", None)
+            else:
+                os.environ["EMBODIED_QUALITY_CACHE"] = previous
+    return f"job={job_id} progress_events={len(progress)}"
+
+
+def t_streaming_and_gate():
+    from embodied_core import evaluate_quality_gate
+    from embodied_core.reports import quality_report
+
+    dataset = open_dataset(FIXTURES / "canonical")
+    try:
+        chunks = list(dataset.iter_frames(chunk_frames=13, max_frames=0))
+        assert len(chunks) > 1, len(chunks)
+        assert sum(len(chunk.ids) for chunk in chunks) == 105
+    finally:
+        dataset.close()
+    quality = quality_report(FIXTURES / "canonical", use_cache=False, chunk_frames=13, max_frames=0)
+    assert quality["scan"]["chunks"] > 1, quality["scan"]
+    assert quality["stats"]["observation.state"]["frames"] == 105, quality["stats"]
+    gate = evaluate_quality_gate(
+        FIXTURES / "canonical",
+        rules={"expected_fps": 30, "required_features": ["observation.state", "action"], "max_nan_ratio": 0.01},
+    )
+    assert gate["ok"], gate["gate"]
+    rejected = evaluate_quality_gate(FIXTURES / "canonical", rules={"expected_fps": 60})
+    assert not rejected["ok"], rejected["gate"]
+    return f"chunks={len(chunks)} gate=pass reject={rejected['gate']['failures'][0]['code']}"
 
 
 def t_convert_jsonl_roundtrip():
@@ -173,7 +263,7 @@ def t_convert_lerobot():
 
 
 def t_catalog():
-    from embodied_core.catalog import export_manifest, index, search, stats
+    from embodied_core.catalog import export_manifest, history, index, search, stats
 
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "catalog.db"
@@ -183,9 +273,14 @@ def t_catalog():
         assert rows, "search returned nothing"
         info = stats(db)
         assert info["total_datasets"] >= 6, info
+        assert info["schema_version"] == 2, info
+        assert info["total_versions"] >= info["total_datasets"], info
+        assert info["total_runs"] >= 1, info
         manifest = export_manifest(db)
         assert manifest["datasets"], manifest
-    return f"indexed={report['total']} search_hits={len(rows)} formats={len(info['by_format'])}"
+        combined = history(db, limit=5)
+        assert combined["versions"] and combined["runs"], combined
+    return f"schema=2 indexed={report['total']} versions={info['total_versions']} runs={info['total_runs']}"
 
 
 def t_scaffold():
@@ -205,6 +300,7 @@ def t_cli():
         ["formats"],
         ["detect", str(FIXTURES / "lerobot_v21"), "--json"],
         ["validate", str(FIXTURES / "canonical"), "--json"],
+        ["gate", str(FIXTURES / "canonical"), "--expected-fps", "30", "--json"],
         ["info", str(FIXTURES / "hdf5"), "--json"],
     ]
     codes = []
@@ -253,7 +349,7 @@ def t_mcp_stdio():
     responses = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     assert len(responses) == 4, [r.get("id") for r in responses]
     tools = responses[1]["result"]["tools"]
-    assert len(tools) == 13, len(tools)
+    assert len(tools) == 19, len(tools)
     detect_payload = json.loads(responses[2]["result"]["content"][0]["text"])
     assert detect_payload["format"] == "rosbag2", detect_payload
     summary_payload = json.loads(responses[3]["result"]["content"][0]["text"])
@@ -277,8 +373,11 @@ for label, fn in [
     ("validate canonical", t_validate_canonical),
     ("validate lerobot", t_validate_lerobot),
     ("quality", t_quality),
+    ("quality cache", t_quality_cache),
     ("segment", t_segment),
     ("labeling tasks", t_label),
+    ("async jobs", t_async_jobs),
+    ("streaming + gate", t_streaming_and_gate),
     ("convert lerobot->jsonl", t_convert_jsonl_roundtrip),
     ("convert jsonl->lerobot", t_convert_lerobot),
     ("catalog", t_catalog),

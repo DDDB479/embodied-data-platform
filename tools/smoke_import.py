@@ -35,6 +35,7 @@ def t_import():
         open_dataset,
     )
     import embodied_core.catalog  # noqa: F401
+    import embodied_core.cache  # noqa: F401
     import embodied_core.cli  # noqa: F401
     import embodied_core.convert  # noqa: F401
     import embodied_core.formats.hdf5  # noqa: F401
@@ -43,8 +44,11 @@ def t_import():
     import embodied_core.formats.mcap  # noqa: F401
     import embodied_core.formats.rlds  # noqa: F401
     import embodied_core.formats.rosbag  # noqa: F401
+    import embodied_core.gate  # noqa: F401
     import embodied_core.mcp_server  # noqa: F401
+    import embodied_core.jobs  # noqa: F401
     import embodied_core.quality  # noqa: F401
+    import embodied_core.reports  # noqa: F401
     import embodied_core.registry  # noqa: F401
     import embodied_core.scaffold  # noqa: F401
     import embodied_core.validate  # noqa: F401
@@ -80,6 +84,7 @@ def t_mcp_list():
     tools = mcp_server.list_tools()
     names = [tool["name"] for tool in tools]
     assert "validate_dataset" in names, names
+    assert "quality_gate" in names and "catalog_history" in names, names
     for tool in tools:
         assert tool["inputSchema"]["type"] == "object", tool
     response = mcp_server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})

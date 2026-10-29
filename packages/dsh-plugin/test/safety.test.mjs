@@ -66,6 +66,30 @@ test('relative path arguments resolve against the session workspace', () => {
   }
 });
 
+test('async job paths resolve against the session workspace too', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'embodied-job-paths-'));
+  try {
+    const input = normalizePathArguments('submit_job', { tool: 'quality_report', arguments: { path: 'datasets/pick' } }, root);
+    assert.equal(input.arguments.path, path.join(root, 'datasets', 'pick'));
+    assert.equal(input.tool, 'quality_report');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate and catalog history paths resolve against the session workspace', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'embodied-new-paths-'));
+  try {
+    const gate = normalizePathArguments('quality_gate', { path: 'datasets/pick' }, root);
+    assert.equal(gate.path, path.join(root, 'datasets', 'pick'));
+    const history = normalizePathArguments('catalog_history', { db: 'catalog.db', path: 'datasets/pick' }, root);
+    assert.equal(history.db, path.join(root, 'catalog.db'));
+    assert.equal(history.path, path.join(root, 'datasets', 'pick'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('write targets are explicit and ignore an absent optional out', () => {
   assert.deepEqual(writeTargets('convert_dataset', { destination: 'out' }).length, 1);
   assert.deepEqual(writeTargets('labeling_tasks', {}), []);

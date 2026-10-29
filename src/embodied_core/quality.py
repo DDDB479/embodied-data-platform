@@ -93,9 +93,14 @@ def compute_dataset_stats(
 
 
 def basic_issue_scan(columns: dict[str, np.ndarray], *, nan_ratio_warn: float = 0.01) -> list[Issue]:
+    return issues_from_stats(compute_feature_stats(columns), nan_ratio_warn=nan_ratio_warn)
+
+
+def issues_from_stats(stats_by_key: Mapping[str, Mapping[str, Any]], *, nan_ratio_warn: float = 0.01) -> list[Issue]:
+    """Turn already-merged feature statistics into the stable issue vocabulary."""
+
     issues: list[Issue] = []
-    for key, values in columns.items():
-        stats = _feature_column_stats(values)
+    for key, stats in stats_by_key.items():
         if stats["nan_count"] or stats["inf_count"]:
             ratio = float(stats["nan_ratio"])
             severity = Severity.ERROR if ratio > nan_ratio_warn else Severity.WARN
@@ -132,6 +137,79 @@ def basic_issue_scan(columns: dict[str, np.ndarray], *, nan_ratio_warn: float = 
                 )
             )
     return issues
+
+
+def merge_feature_stats(parts: Sequence[Mapping[str, Mapping[str, Any]]]) -> dict[str, dict[str, Any]]:
+    """Merge chunk statistics without retaining their frame arrays.
+
+    Min/max/mean/std/non-finite counts are exact. Median and percentiles are a
+    finite-count-weighted blend of chunk estimates and are marked with
+    ``percentiles_estimated=true`` when more than one chunk contributes.
+    """
+
+    keys = sorted({key for part in parts for key in part})
+    merged: dict[str, dict[str, Any]] = {}
+    for key in keys:
+        items = [part[key] for part in parts if key in part]
+        if not items:
+            continue
+        frames = sum(int(item.get("frames", 0)) for item in items)
+        dims = max(int(item.get("dims", 1)) for item in items)
+        nan_count = sum(int(item.get("nan_count", 0)) for item in items)
+        inf_count = sum(int(item.get("inf_count", 0)) for item in items)
+        values = sum(int(item.get("frames", 0)) * int(item.get("dims", 1)) for item in items)
+        finite = max(0, values - nan_count - inf_count)
+        body: dict[str, Any] = {
+            "dims": dims,
+            "frames": frames,
+            "nan_count": nan_count,
+            "inf_count": inf_count,
+            "nan_ratio": round(nan_count / max(values, 1), 4),
+        }
+        numeric_keys = ("min", "max", "mean", "std", "median", "p05", "p95", "norm_mean", "norm_max", "near_zero_ratio")
+        valid = [item for item in items if item.get("mean") is not None]
+        if not valid or finite == 0:
+            body.update({name: None for name in numeric_keys})
+            merged[key] = body
+            continue
+        def weight(item: Mapping[str, Any]) -> int:
+            return max(
+                0,
+                int(item.get("frames", 0)) * int(item.get("dims", 1))
+                - int(item.get("nan_count", 0))
+                - int(item.get("inf_count", 0)),
+            )
+
+        mean = sum(float(item["mean"]) * weight(item) for item in valid) / finite
+        variance = sum(
+            weight(item) * (float(item.get("std") or 0.0) ** 2 + (float(item["mean"]) - mean) ** 2)
+            for item in valid
+        ) / finite
+        body.update(
+            {
+                "min": min(float(item["min"]) for item in valid if item.get("min") is not None),
+                "max": max(float(item["max"]) for item in valid if item.get("max") is not None),
+                "mean": mean,
+                "std": math.sqrt(max(variance, 0.0)),
+                "median": sum(float(item.get("median") or 0.0) * max(1, int(item.get("frames", 0))) for item in valid)
+                / sum(max(1, int(item.get("frames", 0))) for item in valid),
+                "p05": sum(float(item.get("p05") or 0.0) * max(1, int(item.get("frames", 0))) for item in valid)
+                / sum(max(1, int(item.get("frames", 0))) for item in valid),
+                "p95": sum(float(item.get("p95") or 0.0) * max(1, int(item.get("frames", 0))) for item in valid)
+                / sum(max(1, int(item.get("frames", 0))) for item in valid),
+                "norm_mean": sum(float(item.get("norm_mean") or 0.0) * max(1, int(item.get("frames", 0))) for item in valid)
+                / sum(max(1, int(item.get("frames", 0))) for item in valid),
+                "norm_max": max(float(item.get("norm_max") or 0.0) for item in valid),
+                "near_zero_ratio": sum(
+                    float(item.get("near_zero_ratio") or 0.0) * max(1, int(item.get("frames", 0))) for item in valid
+                )
+                / sum(max(1, int(item.get("frames", 0))) for item in valid),
+            }
+        )
+        if len(valid) > 1:
+            body["percentiles_estimated"] = True
+        merged[key] = body
+    return merged
 
 
 # --------------------------------------------------------------------------
@@ -290,6 +368,52 @@ def _window(
         body["start_s"] = round(start / fps, 3)
         body["end_s"] = round(end / fps, 3)
     return body
+
+
+def shift_anomaly_windows(
+    windows: Sequence[dict[str, Any]],
+    offsets: Mapping[int, int],
+    *,
+    fps: float | None = None,
+) -> list[dict[str, Any]]:
+    """Move chunk-local anomaly windows back to episode-local coordinates."""
+
+    shifted: list[dict[str, Any]] = []
+    for window in windows:
+        episode = int(window["episode"])
+        offset = int(offsets.get(episode, 0))
+        item = dict(window)
+        item["start_frame"] = int(item["start_frame"]) + offset
+        item["end_frame"] = int(item["end_frame"]) + offset
+        if fps:
+            item["start_s"] = round(item["start_frame"] / fps, 3)
+            item["end_s"] = round(item["end_frame"] / fps, 3)
+        shifted.append(item)
+    return shifted
+
+
+def shift_segments(
+    segments: Mapping[int, Sequence[dict[str, Any]]],
+    offsets: Mapping[int, int],
+    *,
+    fps: float | None = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Move chunk-local motion segments back to episode-local coordinates."""
+
+    out: dict[int, list[dict[str, Any]]] = {}
+    for episode, rows in segments.items():
+        offset = int(offsets.get(int(episode), 0))
+        moved: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["start_frame"] = int(item["start_frame"]) + offset
+            item["end_frame"] = int(item["end_frame"]) + offset
+            if fps:
+                item["start_s"] = round(item["start_frame"] / fps, 3)
+                item["end_s"] = round(item["end_frame"] / fps, 3)
+            moved.append(item)
+        out[int(episode)] = moved
+    return out
 
 
 # --------------------------------------------------------------------------

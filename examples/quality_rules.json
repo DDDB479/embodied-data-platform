@@ -1,0 +1,14 @@
+{
+  "expected_fps": 30,
+  "fps_tolerance": 0.5,
+  "required_features": ["observation.state", "action"],
+  "required_feature_kinds": ["state", "action"],
+  "min_score": 80,
+  "max_errors": 0,
+  "max_nan_ratio": 0.01,
+  "max_jump_windows": 0,
+  "max_stall_windows": 5,
+  "max_anomaly_windows": 10,
+  "chunk_frames": 50000,
+  "max_frames": 2000000
+}

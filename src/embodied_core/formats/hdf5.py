@@ -19,7 +19,18 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 
 from ..model import DatasetSummary, EpisodeRecord, FeatureSpec
-from .base import DatasetObject, Detection, FramesUnavailable, guess_kind, to_numeric
+from .base import (
+    DatasetObject,
+    Detection,
+    FrameChunk,
+    FrameLimitExceeded,
+    FramesUnavailable,
+    collect_frame_chunks,
+    guess_kind,
+    resolve_chunk_frames,
+    resolve_max_frames,
+    to_numeric,
+)
 
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 IMAGE_KEYS = ("image", "rgb", "depth", "camera")
@@ -132,45 +143,74 @@ class HDF5Dataset(DatasetObject):
         self,
         episodes: Sequence[int] | None = None,
         features: Sequence[str] | None = None,
+        *,
+        max_frames: int | None = None,
     ) -> tuple[list[int], dict[str, np.ndarray]]:
+        return collect_frame_chunks(
+            self.iter_frames(episodes, features, max_frames=max_frames),
+            max_frames=max_frames,
+        )
+
+    def iter_frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        chunk_frames: int | None = None,
+        max_frames: int | None = None,
+    ) -> Iterator[FrameChunk]:
         h5py = _h5py()
         groups = self._episode_groups()
         wanted = set(episodes) if episodes is not None else None
-        merged: dict[str, list[np.ndarray]] = {}
-        ep_ids: list[int] = []
-        lengths: list[int] = []
+        keep = set(features) if features else None
+        size = resolve_chunk_frames(chunk_frames)
+        limit = resolve_max_frames(max_frames)
+        total = 0
+        seen: dict[int, int] = {}
+        emitted = False
         for index, (path, group_path) in groups.items():
             if wanted is not None and index not in wanted:
                 continue
             with h5py.File(path, "r") as handle:
                 node = handle[group_path] if group_path else handle
-                columns: dict[str, np.ndarray] = {}
-                _collect_numeric(node, "", columns)
-            if not columns:
-                continue
-            length = len(next(iter(columns.values())))
-            for name, data in columns.items():
-                if len(data) != length:
+                refs: dict[str, Any] = {}
+                _numeric_datasets(node, "", refs, h5py)
+                if keep is not None:
+                    refs = {name: ref for name, ref in refs.items() if name in keep}
+                if not refs:
                     continue
-                merged.setdefault(name, []).append(data)
-            ep_ids.append(index)
-            lengths.append(length)
-        if not merged:
+                length = len(next(iter(refs.values())))
+                refs = {name: ref for name, ref in refs.items() if len(ref) == length}
+                for start in range(0, length, size):
+                    stop = min(length, start + size)
+                    arrays: dict[str, np.ndarray] = {}
+                    for name, ref in refs.items():
+                        values = np.asarray(ref[start:stop])
+                        if values.ndim == 1:
+                            values = values.reshape(-1, 1)
+                        arrays[name] = values
+                    if not arrays:
+                        continue
+                    frames = stop - start
+                    total += frames
+                    if limit and total > limit:
+                        raise FrameLimitExceeded(limit, total)
+                    offsets = {index: seen.get(index, 0)}
+                    seen[index] = seen.get(index, 0) + frames
+                    emitted = True
+                    yield FrameChunk([index] * frames, arrays, offsets)
+        if not emitted:
             raise FramesUnavailable("no numeric (T, D) datasets found in the HDF5 groups")
-        out: dict[str, np.ndarray] = {}
-        for name, parts in merged.items():
-            try:
-                out[name] = np.concatenate(parts, axis=0)
-            except ValueError:
-                continue
-        if features:
-            keep = set(features)
-            out = {k: v for k, v in out.items() if k in keep}
-        # Callers slice by episode id per *frame* (quality, segmentation), so the
-        # id list must expand to one entry per concatenated row rather than
-        # staying one entry per demo.
-        frame_ids = np.repeat(np.asarray(ep_ids, dtype=np.int64), np.asarray(lengths, dtype=np.int64)).tolist()
-        return frame_ids, out
+
+
+def _numeric_datasets(group: Any, prefix: str, out: dict[str, Any], h5py: Any) -> None:
+    for name, item in group.items():
+        path = f"{prefix}/{name}".lstrip("/")
+        if isinstance(item, h5py.Dataset):
+            if item.ndim in (1, 2) and item.dtype.kind in "fiub":
+                out[path] = item
+        elif isinstance(item, h5py.Group):
+            _numeric_datasets(item, path, out, h5py)
 
 
 def load(root: Path, detection: Detection | None = None) -> HDF5Dataset:
