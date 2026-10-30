@@ -94,6 +94,7 @@ print(report["score"], [i["code"] for i in report["issues"]])
 
 | 文档 | 内容 |
 | --- | --- |
+| [docs/features.md](docs/features.md) | 插件功能总览、工具清单、工作流与验证状态 |
 | [docs/getting-started.md](docs/getting-started.md) | 安装、第一个数据集、常见工作流 |
 | [docs/formats.md](docs/formats.md) | 支持矩阵、每种格式的探测依据、如何新增适配器 |
 | [docs/mcp.md](docs/mcp.md) | 23 个 MCP 工具的参数与返回结构 |
