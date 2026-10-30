@@ -38,6 +38,13 @@ class CliTestCase(unittest.TestCase):
         names = {item["format"] for item in payload}
         self.assertTrue({"lerobot", "hdf5", "rosbag2", "embodied-jsonl"} <= names, names)
 
+    def test_doctor_reports_v05_capabilities(self) -> None:
+        code, output = _run("doctor", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["version"], "0.5.0")
+        self.assertIn("sensor_msgs/JointState", payload["ros2_cdr"]["message_types"])
+
     def test_detect_json(self) -> None:
         code, output = _run("detect", str(self.dataset), "--json")
         self.assertEqual(code, 0)
@@ -152,6 +159,49 @@ class CliTestCase(unittest.TestCase):
             self.skipTest("pyarrow not installed")
         self.assertEqual(code, 0)
         self.assertTrue((target / "meta" / "info.json").is_file())
+
+    def test_convert_v3_command(self) -> None:
+        if not support.has_pyarrow():
+            self.skipTest("pyarrow not installed")
+        target = self.root / "v3"
+        code, output = _run(
+            "convert",
+            str(self.dataset),
+            str(target),
+            "--target",
+            "lerobot-v3",
+            "--train-ratio",
+            "0.5",
+            "--val-ratio",
+            "0.5",
+            "--json",
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["splits"], {"train": "0:1", "validation": "1:2"})
+        self.assertTrue((target / "meta" / "stats.json").is_file())
+
+    def test_media_review_and_storage_commands(self) -> None:
+        code, output = _run("media", str(self.dataset), "--no-probe", "--json")
+        self.assertEqual(code, 0)
+        self.assertIn("counts", json.loads(output))
+
+        spiky = support.write_jsonl_dataset(self.root / "spiky", spikes=True)
+        manifest = self.root / "tasks.json"
+        code, _ = _run("label", str(spiky), "--out", str(manifest))
+        self.assertEqual(code, 0)
+        labels = self.root / "labels.jsonl"
+        task_id = json.loads(manifest.read_text(encoding="utf-8"))["tasks"][0]["task_id"]
+        labels.write_text(json.dumps({"task_id": task_id, "answer": "valid"}) + "\n", encoding="utf-8")
+        review = self.root / "review.json"
+        code, output = _run("review", "--manifest", str(manifest), "--labels", str(labels), "--out", str(review), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["counts"]["valid"], 1)
+
+        destination = self.root / "pulled"
+        code, output = _run("storage", "pull", str(self.dataset), str(destination), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["files"], 2)
 
     def test_scaffold_command(self) -> None:
         code, _ = _run("scaffold", str(self.root / "proj"), "--kind", "pipeline", "--name", "daily")

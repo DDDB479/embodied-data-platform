@@ -3,7 +3,7 @@
 安装后入口是 `embodied`；没安装时用 `PYTHONPATH=src python -m embodied_core.cli`。
 
 ```text
-embodied {formats,detect,info,validate,gate,quality,segment,label,convert,scaffold,windows,checks,catalog} ...
+embodied {doctor,formats,detect,info,validate,gate,media,quality,segment,label,review,convert,scaffold,windows,checks,catalog,storage,api} ...
 embodied --version
 ```
 
@@ -32,6 +32,14 @@ embodied checks             # 8 组检查与默认启用集合
 ```
 
 两者都是纯查询，不碰数据。
+
+## doctor
+
+```bash
+embodied doctor --json
+```
+
+输出可选依赖、ROS 2 CDR 类型、RLDS/TFRecord/点云资源上限、ffprobe、S3 与 HTTP API 能力。
 
 ## detect
 
@@ -122,14 +130,32 @@ embodied label ./data/aloha [--max-tasks 100] [--z 8] [--segments] [--out tasks.
 
 `--out` 时不打印整份清单，只打印落盘路径与任务数；写出的就是 `{dataset, task_count, tasks, instructions}`。
 
+## media
+
+```bash
+embodied media ./data/aloha [--max-videos 4] [--no-probe] [--json]
+```
+
+列出 image/video/depth/point_cloud/language 模态；ffprobe 可用时才探测视频，`--no-probe` 完全跳过外部进程。
+
+## review
+
+```bash
+embodied review --manifest tasks.json [--labels labels.jsonl] [--out review.json] [--json]
+```
+
+标签支持 stable `task_id`（也兼容 legacy `id`），answer 规范化为 `valid/invalid/needs_fix/unknown`；重复标签 last-wins 并记录冲突。
+
 ## convert
 
 ```bash
 embodied convert ./data/aloha ./out/lerobot --target lerobot [--episodes 0 1] [--overwrite] [--format hdf5] [--json]
+embodied convert ./data/aloha ./out/lerobot-v3 --target lerobot-v3 --train-ratio 0.9 --val-ratio 0.1 --test-ratio 0 [--json]
 ```
 
 - `--target jsonl`：canonical JSONL，零依赖，落盘 `dataset.json` + `episodes.jsonl`。
 - `--target lerobot`：v2.1 布局（每 episode 一个 parquet），需要 `pyarrow`。
+- `--target lerobot-v3`：v3.0 布局 + `meta/stats.json` + splits，并在导出后自检。
 - `--format` 强制源格式，跳过自动识别。
 - 只导数值特征；相机流进 `dropped_features`。
 
@@ -170,3 +196,22 @@ embodied catalog history  [--db catalog.db] [--path DATASET] [--limit 20]
 `index` / `stats` / `remove` 默认就输出 JSON（这些命令本来就没有"好看"的形态），`search` / `export` 带 `--json` 时输出 `{count, results[]}` / `{datasets[], count}`。
 
 `index` 的增量逻辑：每个数据集记一个 marker 文件（`meta/info.json`、`episodes.jsonl`、`dataset.json` 等，取 mtime 最新者）的 mtime 与目录总大小，两者都没变就跳过。追加 episode 会更新 `episodes.jsonl`，因此能被识别为 `updated`。
+
+## storage
+
+```bash
+embodied storage info s3://bucket/prefix --json
+embodied storage pull file:///data/night_run ./cache/night_run [--overwrite] [--retries 2] [--json]
+embodied storage pull https://example.com/episode.bin ./cache/episode.bin
+embodied storage pull s3://bucket/prefix ./cache/dataset
+```
+
+拉取到临时目录后校验 SHA-256，再原子替换目标；目标目录会写 `.embodied-source.json`。S3 需要 `pip install 'embodied-core[s3]'`。
+
+## api
+
+```bash
+embodied api --db catalog.db --host 127.0.0.1 --port 8000 [--token TOKEN] [--cors '*']
+```
+
+只读 HTTP Catalog API；`/health`、`/v1/stats`、分页 `/v1/datasets`、版本/谱系和 `/v1/runs`。端点与 ETag 细节见 [api.md](api.md)。

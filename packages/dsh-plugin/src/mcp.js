@@ -124,7 +124,7 @@ export class McpClient {
     await this.request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: 'dsh-embodied-data', version: '0.3.0' },
+      clientInfo: { name: 'dsh-embodied-data', version: '0.5.0' },
     }, { timeoutMs: this.config.startupTimeoutMs, skipEnsure: true });
     this.#write({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
     return child;

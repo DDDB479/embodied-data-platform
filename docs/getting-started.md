@@ -73,6 +73,8 @@ embodied gate "$DATA" --rules rules.json
 
 # 4) 转换：只有通过质量门的样本才进训练集
 embodied convert "$DATA" ./out/lerobot --target lerobot
+# 需要 stats/scikit 风格归一化与 splits 时：
+embodied convert "$DATA" ./out/lerobot-v3 --target lerobot-v3 --train-ratio 0.9 --val-ratio 0.1
 
 # 5) 编目，供后续检索；版本/运行/谱系可追溯
 embodied catalog index ./datasets --db catalog.db

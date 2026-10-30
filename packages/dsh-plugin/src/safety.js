@@ -30,6 +30,10 @@ export const PATH_ARGUMENTS = Object.freeze({
   catalog_search: ['db'],
   catalog_stats: ['db'],
   catalog_history: ['db', 'path'],
+  inspect_media: ['path'],
+  decode_samples: ['path'],
+  apply_annotations: ['manifest', 'previous', 'out'],
+  storage_pull: ['destination'],
   plan_windows: ['path'],
 });
 
@@ -39,6 +43,8 @@ export const WRITE_TARGETS = Object.freeze({
   convert_dataset: ['destination'],
   scaffold_project: ['destination'],
   catalog_index: ['db'],
+  apply_annotations: ['out'],
+  storage_pull: ['destination'],
 });
 
 export const WRITE_TOOLS = new Set(Object.keys(WRITE_TARGETS));

@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased (0.3.0)
+## Unreleased (0.5.0)
+
+### Stability and operations
+
+- Added `embodied doctor` and `list_formats.platform` capability reports for optional dependencies, CDR types, ffprobe, S3, HTTP API and resource limits.
+- Added configurable limits for CDR messages (`EMBODIED_MAX_MESSAGE_BYTES`), point clouds (`EMBODIED_MAX_POINTS`), TFRecord records (`EMBODIED_MAX_RECORD_BYTES`) and object downloads (`EMBODIED_MAX_DOWNLOAD_BYTES`).
+- LeRobot v3 export and object-store materialization now stage writes and publish atomically; v3 export runs structural validation before returning.
+- Annotation feedback supports `previous` merge, stable task IDs, last-wins duplicates, conflict/coverage reporting and atomic output.
+- HTTP Catalog API adds stable ETags, bounded pagination, Bearer/X-API-Key auth and read-only endpoint semantics.
+- Unknown CDR schemas and malformed payloads now fail with stable `unsupported_message_type` / `decoder_error` codes instead of silent numeric output.
+
+## 0.4.0 - 2026-10-29
+
+### Stream decoding and platform features
+
+- Added a dependency-free ROS 2 CDR reader and decoders for JointState, Imu, Odometry, Pose/Twist/Vector3, Image/depth, PointCloud2, LaserScan, scalar, array and String/language topics.
+- rosbag2 now exposes CDR-backed `frames()` and `topic_samples()`; MCAP reuses the decoder when the `mcap` package is installed.
+- Added a lightweight TFRecord + TensorFlow Example/SequenceExample decoder for RLDS, including step-aligned numeric columns and language text without TensorFlow.
+- Added optional ffprobe video metadata probing and image/video/depth/point-cloud/language modality inventory.
+- Added `apply_annotations` and `embodied review` for closed-loop labeling feedback.
+- Added LeRobot v3.0 conversion with `meta/stats.json`, episode metadata, train/validation/test splits and post-export validation.
+- Added a read-only HTTP Catalog API (`embodied api` / `embodied-api`) and atomic file/http(s)/s3 object-store pulls with SHA-256 source manifests.
+
+## 0.3.0 - 2026-10-29
 
 ### Async jobs and progress
 

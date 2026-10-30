@@ -15,10 +15,23 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Sequence
+
+import numpy as np
 
 from ..model import DatasetSummary, EpisodeRecord, FeatureSpec
-from .base import DatasetObject, Detection, FramesUnavailable, guess_kind
+from ..tfrecord import RLDSEpisode, TFRecordError, decode_rlds_record, iter_tfrecords
+from .base import (
+    DatasetObject,
+    Detection,
+    FrameChunk,
+    FrameLimitExceeded,
+    FramesUnavailable,
+    collect_frame_chunks,
+    guess_kind,
+    resolve_chunk_frames,
+    resolve_max_frames,
+)
 
 FORMAT = "rlds"
 
@@ -182,14 +195,101 @@ def _split_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 class RLDSDataset(DatasetObject):
     def __init__(self, root: Path, summary: DatasetSummary) -> None:
-        super().__init__(root, summary, capabilities={"episodes", "metadata"})
+        capabilities = {"episodes", "metadata"}
+        if summary.meta.get("light_decoder"):
+            capabilities.add("frames")
+        super().__init__(root, summary, capabilities=capabilities)
 
     @staticmethod
     def optional_dependencies() -> dict[str, str]:
-        return {"tensorflow": "decode TFRecord example protos (tensorflow / tensorflow-datasets)"}
+        return {"tensorflow": "optional fallback for exotic RLDS protos; common Example/SequenceExample records decode without it"}
 
-    def frames(self, episodes=None, features=None, *, max_frames=None):  # noqa: ANN001
-        raise FramesUnavailable("RLDS frames live in TFRecord example protos; install tensorflow or convert with tfds")
+    def frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        max_frames: int | None = None,
+    ) -> tuple[list[int], dict[str, np.ndarray]]:
+        return collect_frame_chunks(
+            self.iter_frames(episodes, features, max_frames=max_frames),
+            max_frames=max_frames,
+        )
+
+    def iter_frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        chunk_frames: int | None = None,
+        max_frames: int | None = None,
+    ) -> Iterator[FrameChunk]:
+        wanted = set(episodes) if episodes is not None else None
+        keep = set(features) if features else None
+        size = resolve_chunk_frames(chunk_frames)
+        limit = resolve_max_frames(max_frames)
+        total = 0
+        seen: dict[int, int] = {}
+        emitted = False
+        episode_counter = 0
+        for shard in _shards(self.root):
+            for payload in iter_tfrecords(shard):
+                index = episode_counter
+                episode_counter += 1
+                try:
+                    episode = decode_rlds_record(payload)
+                except TFRecordError:
+                    continue
+                if wanted is not None and index not in wanted:
+                    continue
+                columns = episode.numeric_columns()
+                if keep is not None:
+                    columns = {key: value for key, value in columns.items() if key in keep}
+                if not columns:
+                    continue
+                length = max((int(value.shape[0]) for value in columns.values()), default=0)
+                if not length:
+                    continue
+                for start in range(0, length, size):
+                    stop = min(length, start + size)
+                    chunk_columns = {key: value[start:stop] for key, value in columns.items()}
+                    frames = stop - start
+                    total += frames
+                    if limit and total > limit:
+                        raise FrameLimitExceeded(limit, total)
+                    offsets = {index: seen.get(index, 0)}
+                    seen[index] = seen.get(index, 0) + frames
+                    emitted = True
+                    yield FrameChunk([index] * frames, chunk_columns, offsets)
+        if not emitted:
+            raise FramesUnavailable("no RLDS numeric step features could be decoded")
+
+    def episode_samples(self, *, episode: int | None = None, limit: int = 1) -> dict[str, Any]:
+        samples = []
+        current = 0
+        for shard in _shards(self.root):
+            for payload in iter_tfrecords(shard):
+                decoded = decode_rlds_record(payload)
+                if episode is not None and current != episode:
+                    current += 1
+                    continue
+                samples.append(
+                    {
+                        "episode": current,
+                        "shard": shard.name,
+                        "length": decoded.length,
+                        "encoding": decoded.encoding,
+                        "context": decoded.context,
+                        "texts": decoded.texts(),
+                        "features": sorted(decoded.fields),
+                    }
+                )
+                current += 1
+                if len(samples) >= max(1, int(limit)):
+                    return {"episode": episode, "samples": samples}
+                if episode is not None:
+                    return {"episode": episode, "samples": samples}
+        return {"episode": episode, "samples": samples}
 
 
 def load(root: Path, detection: Detection | None = None) -> RLDSDataset:
@@ -210,6 +310,37 @@ def load(root: Path, detection: Detection | None = None) -> RLDSDataset:
         notes.append("no feature descriptions found")
     shards = _shards(root)
     split_rows = _split_rows(payload)
+    decoder_info: dict[str, Any] = {}
+    decoded_keys: list[str] = []
+    inferred_fps: float | None = None
+    for shard in shards:
+        try:
+            payload_record = next(iter_tfrecords(shard))
+            decoded = decode_rlds_record(payload_record)
+        except (StopIteration, TFRecordError, OSError) as exc:
+            notes.append(f"light decoder: {shard.name}: {exc}")
+            continue
+        decoder_info = {
+            "encoding": decoded.encoding,
+            "length": decoded.length,
+            "context_keys": sorted(decoded.context),
+        }
+        decoded_keys = sorted(decoded.numeric_columns())
+        for key in ("steps/timestamp", "timestamp"):
+            values = decoded.numeric_columns().get(key)
+            if values is not None and values.shape[0] > 2:
+                diffs = np.diff(values[:, 0])
+                diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+                if diffs.size:
+                    inferred_fps = float(1.0 / float(np.median(diffs)))
+                break
+        break
+    if decoded_keys:
+        known = {feature.key for feature in features}
+        for key in decoded_keys:
+            if key not in known:
+                features.append(FeatureSpec(key=key, dtype="float64", shape=(), kind=guess_kind(key)))
+        notes.append(f"light decoder available ({decoder_info.get('encoding')})")
     records: list[EpisodeRecord] = []
     total_steps = 0
     for shard in shards[:500]:
@@ -230,13 +361,15 @@ def load(root: Path, detection: Detection | None = None) -> RLDSDataset:
         "steps": total_steps,
         "license": payload.get("license"),
         "description": payload.get("description"),
+        "light_decoder": decoder_info or None,
+        "decoded_features": decoded_keys,
     }
     split = split_rows[0]["name"] if split_rows and split_rows[0].get("name") else None
     summary = DatasetSummary(
         path=str(root),
         format=FORMAT,
         version=str(payload.get("dataset_version") or "") or None,
-        fps=None,
+        fps=inferred_fps,
         robot_type=payload.get("robot_type") if isinstance(payload.get("robot_type"), str) else None,
         features=features,
         episodes=records,

@@ -6,15 +6,15 @@
 | --- | --- | --- | --- | --- |
 | `lerobot` v2.1 / v3.0 | `meta/info.json` + `meta/episodes*` 或 `data/**/*.parquet` | `pyarrow` | ✅ | LeRobot 训练流水线 |
 | `hdf5` | HDF5 魔数 `\x89HDF\r\n\x1a\n` | `h5py` | ✅ | robomimic、ALOHA、自建遥操作 |
-| `mcap` | MCAP 魔数 `\x89MCAP0\r\n` | `mcap`（内置 stdlib 回退） | ❌ | Foxglove、自动驾驶/机器人总线录制 |
-| `rosbag2` | `.db3` 且有 `topics` + `messages` 表 | 无（sqlite3） | ❌ | ROS 2 |
+| `mcap` | MCAP 魔数 `\x89MCAP0\r\n` | `mcap`（内置 stdlib metadata 回退） | ✅ CDR 常见 ROS 2 类型 | Foxglove、自动驾驶/机器人总线录制 |
+| `rosbag2` | `.db3` 且有 `topics` + `messages` 表 | 无（sqlite3 + 内置 CDR） | ✅ CDR 常见 ROS 2 类型 | ROS 2 |
 | `rosbag1` | `#ROSBAG V2.0\n` | 无 | ❌ | 老 ROS 1 |
-| `rlds` | `dataset_info.json` / `features.json` + shards | `tensorflow`（解码 example proto） | ❌ | TFDS 生态、Open X-Embodiment |
+| `rlds` | `dataset_info.json` / `features.json` + shards | 无（Example/SequenceExample 轻量解码）；TensorFlow 可选 | ✅ 常见 TFDS 记录 | TFDS 生态、Open X-Embodiment |
 | `embodied-jsonl` | `dataset.json` 的 format 标记，或 JSONL episode 行 | 无 | ✅ | 本工具链的 canonical 交换格式 |
 
-"能读帧"= `dataset.frames()` 返回 `(ids, dict[str, 2D ndarray])`，可以把数值列交给质量分析与转换。大文件优先用 `dataset.iter_frames(chunk_frames=...)`，它产出带 `offsets` 的 `FrameChunk`，并受 `max_frames` / `EMBODIED_MAX_FRAMES` 上限保护。"不能"= 抛 `FramesUnavailable(reason, install)`，但**元数据级能力照常**：识别、统计 episode/消息数、校验、编目都能用。
+"能读帧"= `dataset.frames()` 返回 `(ids, dict[str, 2D ndarray])`，可以把数值列交给质量分析与转换。大文件优先用 `dataset.iter_frames(chunk_frames=...)`，它产出带 `offsets` 的 `FrameChunk`，并受 `max_frames` / `EMBODIED_MAX_FRAMES` 上限保护。未注册的自定义 CDR schema 或特殊 proto 会抛 `FramesUnavailable` / `UnsupportedMessageType`，但**元数据级能力照常**。
 
-为什么 MCAP / rosbag / RLDS 读不了帧：这些格式里的"帧"要先按 schema 解码（ROS 的 `sensor_msgs/Image`、CDR 编码、TFRecord 的 Example proto）。硬解码会把工具链绑死在某个 SDK 的版本上，所以这里显式划界——需要逐帧时请先转成 LeRobot/HDF5，或者写一个项目内的解码器。
+rosbag2 使用内置 CDR reader，支持 JointState、Imu、Odometry、Pose/Twist/Vector3、Image/深度图、PointCloud2、LaserScan、String/语言指令、Float/Int 数组和常用标量。MCAP 需要 `mcap` 包来遍历消息，再复用同一 CDR 解码器。RLDS 内置 TFRecord framing 和 `tensorflow.Example` / `SequenceExample` 的 protobuf 子集解析；只有非常规编码才需要 TensorFlow。CDR 消息、TFRecord、点云分别受 `EMBODIED_MAX_MESSAGE_BYTES`、`EMBODIED_MAX_RECORD_BYTES`、`EMBODIED_MAX_POINTS` 限制。
 
 ## 探测是怎么做的
 
@@ -54,6 +54,8 @@ videos/<camera_key>/chunk-000/file-000.mp4
 ```
 
 校验会检查 v3 的 `chunk-XXX` / `file-XXX` 编号是否从 000 连续，缺失的 metadata 会降级为 note 而不是崩溃（`lerobot.meta_missing`）。
+
+`embodied convert --target lerobot-v3` 写出的 `meta/stats.json` 包含每个数值特征的 `count/mean/std/min/max/q01/q99`；`meta/info.json.splits` 和 episode metadata 的 `split` 字段给出 train/validation/test 划分。导出完成会自动跑 `structure + lerobot.spec` 校验。
 
 ## canonical JSONL
 

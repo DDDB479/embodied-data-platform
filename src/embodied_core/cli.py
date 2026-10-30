@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
+from .annotations import apply_annotation_feedback
+from .api import create_server
 from .cache import QualityCache
 from .catalog import (
     export_manifest,
@@ -28,10 +31,13 @@ from .catalog import (
 )
 from .convert import ConversionError, convert
 from .gate import evaluate_quality_gate, load_quality_rules
+from .media import probe_dataset_media
+from .platform import capability_report
 from .model import summarize_issues, to_jsonable
 from .quality import build_labeling_tasks, compute_dataset_stats, detect_anomalies, make_windows, segment_by_motion
 from .registry import UnsupportedFormat, describe_formats, detect_dataset, open_dataset
 from .reports import quality_report
+from .storage import parse_storage_uri, pull as storage_pull
 from .scaffold import scaffold
 from .validate import CHECKS, DEFAULT_CHECKS, run_checks, validate
 
@@ -66,6 +72,12 @@ def cmd_formats(args: argparse.Namespace) -> int:
     print(f"{'format':<15} {'needs':<28} detect")
     for row in rows:
         print(f"{row['format']:<15} {row['needs'][:27]:<28} {row['detect']}")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    payload = capability_report()
+    _emit(payload, True)
     return 0
 
 
@@ -168,6 +180,68 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0 if payload["ok"] else 1
 
 
+def cmd_media(args: argparse.Namespace) -> int:
+    dataset = _dataset_or_exit(args.path)
+    try:
+        payload = probe_dataset_media(dataset, max_videos=args.max_videos, probe=not args.no_probe)
+    finally:
+        dataset.close()
+    _emit(payload, True)
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    try:
+        if args.labels:
+            payload = apply_annotation_feedback(args.manifest, args.labels, out=args.out)
+        else:
+            payload = apply_annotation_feedback(args.manifest, [], out=args.out)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _emit(payload, True)
+    return 0 if payload.get("ok") else 1
+
+
+def cmd_storage(args: argparse.Namespace) -> int:
+    try:
+        if args.storage_command == "info":
+            parsed = parse_storage_uri(args.uri)
+            _emit({"uri": parsed.raw, "scheme": parsed.scheme, "location": parsed.location}, True)
+            return 0
+        result = storage_pull(args.uri, args.destination, overwrite=args.overwrite, retries=args.retries)
+    except FileExistsError as exc:
+        print(f"error: destination exists: {exc}; pass --overwrite", file=sys.stderr)
+        return 5
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _emit(result, True)
+    return 0
+
+
+def cmd_api(args: argparse.Namespace) -> int:
+    try:
+        server = create_server(
+            args.db,
+            host=args.host,
+            port=args.port,
+            token=args.token,
+            cors=args.cors,
+        )
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"serving {args.db} on http://{args.host}:{server.server_address[1]}", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def cmd_quality(args: argparse.Namespace) -> int:
     try:
         payload = quality_report(
@@ -241,8 +315,17 @@ def cmd_label(args: argparse.Namespace) -> int:
 
 def cmd_convert(args: argparse.Namespace) -> int:
     try:
-        result = convert(args.source, args.destination, target=args.target, overwrite=args.overwrite, format=args.format,
-                         episodes=[int(v) for v in (args.episodes or [])] or None)
+        result = convert(
+            args.source,
+            args.destination,
+            target=args.target,
+            overwrite=args.overwrite,
+            format=args.format,
+            episodes=[int(v) for v in (args.episodes or [])] or None,
+            train_ratio=args.train_ratio,
+            validation_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+        )
     except ConversionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 4
@@ -363,6 +446,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_formats)
 
+    p = sub.add_parser("doctor", help="show optional dependencies, decoder limits and platform capabilities")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_doctor)
+
     p = sub.add_parser("detect", help="detect the format of a path")
     p.add_argument("path")
     p.add_argument("--json", action="store_true")
@@ -397,6 +484,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_gate)
 
+    p = sub.add_parser("media", help="inventory modalities and optionally probe video with ffprobe")
+    p.add_argument("path")
+    p.add_argument("--max-videos", type=int, default=4)
+    p.add_argument("--no-probe", action="store_true", help="inventory only; never call ffprobe")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_media)
+
     p = sub.add_parser("quality", help="feature statistics and anomaly windows")
     p.add_argument("path")
     p.add_argument("--episodes", nargs="*", type=int, help="restrict to these episode indices")
@@ -429,13 +523,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--segments", action="store_true", help="also ask for phase descriptions")
     p.set_defaults(func=cmd_label)
 
+    p = sub.add_parser("review", help="reconcile annotation labels with a labeling manifest")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--labels", help="labels JSON/JSONL; omit to report pending coverage")
+    p.add_argument("--out", help="write the reviewed manifest JSON or labels JSONL")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_review)
+
     p = sub.add_parser("convert", help="convert between layouts")
     p.add_argument("source")
     p.add_argument("destination")
-    p.add_argument("--target", default="jsonl", choices=["jsonl", "lerobot"])
+    p.add_argument("--target", default="jsonl", choices=["jsonl", "lerobot", "lerobot-v3"])
     p.add_argument("--format", help="force the source format")
     p.add_argument("--episodes", nargs="*", help="only these episodes (jsonl target)")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--train-ratio", type=float, default=0.9, help="v3 train split ratio")
+    p.add_argument("--val-ratio", type=float, default=0.0, help="v3 validation split ratio")
+    p.add_argument("--test-ratio", type=float, default=0.0, help="v3 test split ratio")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_convert)
 
@@ -517,6 +621,28 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--path")
     c.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_catalog)
+
+    p = sub.add_parser("storage", help="materialize local/HTTP/S3 datasets atomically")
+    store = p.add_subparsers(dest="storage_command", required=True)
+    c = store.add_parser("pull", help="download/copy a URI into a local dataset directory")
+    c.add_argument("uri")
+    c.add_argument("destination")
+    c.add_argument("--overwrite", action="store_true")
+    c.add_argument("--retries", type=int, default=2)
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_storage)
+    c = store.add_parser("info", help="parse a storage URI")
+    c.add_argument("uri")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_storage)
+
+    p = sub.add_parser("api", help="serve the read-only HTTP Catalog API")
+    p.add_argument("--db", required=True)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--token", default=os.environ.get("EMBODIED_API_TOKEN"))
+    p.add_argument("--cors", default=None)
+    p.set_defaults(func=cmd_api)
 
     p = sub.add_parser("cache", help="inspect or clear the quality report cache")
     cache = p.add_subparsers(dest="cache_command", required=True)

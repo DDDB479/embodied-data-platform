@@ -90,6 +90,23 @@ test('gate and catalog history paths resolve against the session workspace', () 
   }
 });
 
+test('media, annotation and storage paths are normalized and guarded', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'embodied-v4-paths-'));
+  try {
+    const media = normalizePathArguments('inspect_media', { path: 'datasets/pick' }, root);
+    assert.equal(media.path, path.join(root, 'datasets', 'pick'));
+    const samples = normalizePathArguments('decode_samples', { path: 'bag', topic: '/joint_states' }, root);
+    assert.equal(samples.path, path.join(root, 'bag'));
+    const annotations = normalizePathArguments('apply_annotations', { manifest: 'tasks.json', out: 'review.json' }, root);
+    assert.equal(annotations.manifest, path.join(root, 'tasks.json'));
+    assert.equal(annotations.out, path.join(root, 'review.json'));
+    assert.deepEqual(writeTargets('apply_annotations', { out: 'review.json' }).length, 1);
+    assert.deepEqual(writeTargets('storage_pull', { destination: 'pulled' }).length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('write targets are explicit and ignore an absent optional out', () => {
   assert.deepEqual(writeTargets('convert_dataset', { destination: 'out' }).length, 1);
   assert.deepEqual(writeTargets('labeling_tasks', {}), []);

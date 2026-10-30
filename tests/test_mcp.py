@@ -48,7 +48,7 @@ class McpProtocolTestCase(unittest.TestCase):
 
     def test_tools_list_shape(self) -> None:
         result = _rpc("tools/list")["result"]
-        self.assertEqual(len(result["tools"]), 19)
+        self.assertEqual(len(result["tools"]), 23)
         for tool in result["tools"]:
             self.assertIn("name", tool)
             self.assertIn("description", tool)
@@ -57,7 +57,7 @@ class McpProtocolTestCase(unittest.TestCase):
                 set(tool["annotations"]),
                 {"readOnlyHint", "destructiveHint", "openWorldHint"},
             )
-            self.assertIs(tool["annotations"]["openWorldHint"], False)
+            self.assertIs(tool["annotations"]["openWorldHint"], tool["name"] == "storage_pull")
         by_name = {tool["name"]: tool for tool in result["tools"]}
         self.assertTrue(by_name["list_formats"]["annotations"]["readOnlyHint"])
         self.assertFalse(by_name["convert_dataset"]["annotations"]["readOnlyHint"])
@@ -65,6 +65,10 @@ class McpProtocolTestCase(unittest.TestCase):
         self.assertIn("job_status", by_name)
         self.assertIn("quality_gate", by_name)
         self.assertIn("catalog_history", by_name)
+        self.assertIn("inspect_media", by_name)
+        self.assertIn("decode_samples", by_name)
+        self.assertIn("apply_annotations", by_name)
+        self.assertIn("storage_pull", by_name)
 
     def test_unknown_method_is_an_error(self) -> None:
         response = _rpc("does/not/exist")
@@ -144,6 +148,59 @@ class McpToolTestCase(unittest.TestCase):
         failed, plan = _call("plan_windows", {"path": str(self.dataset), "window": 8, "stride": 8})
         self.assertFalse(failed)
         self.assertGreater(plan["count"], 0)
+
+    def test_convert_to_lerobot_v3(self) -> None:
+        if not support.has_pyarrow():
+            self.skipTest("pyarrow not installed")
+        failed, result = _call(
+            "convert_dataset",
+            {
+                "source": str(self.dataset),
+                "destination": str(self.root / "v3"),
+                "target": "lerobot-v3",
+                "train_ratio": 0.5,
+                "validation_ratio": 0.5,
+            },
+        )
+        self.assertFalse(failed)
+        self.assertEqual(result["target"], "lerobot(v3.0)")
+        self.assertEqual(result["splits"], {"train": "0:1", "validation": "1:2"})
+
+    def test_inspect_media_and_decode_cdr_samples(self) -> None:
+        with mock.patch("embodied_core.media.find_ffprobe", return_value=None):
+            failed, media = _call("inspect_media", {"path": str(self.dataset)})
+        self.assertFalse(failed)
+        self.assertIn("counts", media)
+        self.assertFalse(media["video_probe"]["available"])
+
+        path = support.write_rosbag2_cdr(self.root / "bag", messages=3)
+        failed, samples = _call(
+            "decode_samples",
+            {"path": str(path), "topic": "/instruction", "limit": 1, "include_arrays": False},
+        )
+        self.assertFalse(failed)
+        self.assertEqual(samples["samples"][0]["text"]["data"], "pick up the red cube")
+
+    def test_apply_annotations_and_storage_pull(self) -> None:
+        spiky = support.write_jsonl_dataset(self.root / "spiky", spikes=True)
+        failed, manifest = _call("labeling_tasks", {"path": str(spiky), "max_tasks": 2})
+        self.assertFalse(failed)
+        task_id = manifest["tasks"][0]["task_id"]
+        out = self.root / "review.json"
+        failed, reviewed = _call(
+            "apply_annotations",
+            {"manifest": manifest, "labels": [{"task_id": task_id, "answer": "needs_fix"}], "out": str(out)},
+        )
+        self.assertFalse(failed)
+        self.assertEqual(reviewed["counts"]["needs_fix"], 1)
+        self.assertTrue(out.is_file())
+
+        source = self.root / "object-store"
+        source.mkdir()
+        (source / "payload.bin").write_bytes(b"abc")
+        failed, pulled = _call("storage_pull", {"uri": str(source), "destination": str(self.root / "pulled")})
+        self.assertFalse(failed)
+        self.assertEqual(pulled["files"], 1)
 
     def test_catalog_round_trip(self) -> None:
         db = self.root / "catalog.db"

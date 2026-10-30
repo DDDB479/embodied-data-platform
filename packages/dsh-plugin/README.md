@@ -1,6 +1,6 @@
 # dsh-embodied-data
 
-DeepSeek Harness 插件：把 [embodied-data-studio](../../README.md) 的 19 个 MCP 工具注册成原生 agent 工具，并注入使用它们的正确顺序。
+DeepSeek Harness 插件：把 [embodied-data-studio](../../README.md) 的 23 个 MCP 工具注册成原生 agent 工具，并注入使用它们的正确顺序。
 
 零依赖纯 ESM——不需要 `tsc`，不在 `node_modules` 里拉任何东西。JS 只做一件事：管理 `python -m embodied_core.mcp_server` 子进程并做 JSON-RPC 桥接。
 
@@ -25,12 +25,16 @@ node --test test/*.test.mjs                       # 路径、并发与审批单�
 | `embodied_quality_gate` | 可配置 fps/特征/分数/异常阈值质量门 |
 | `embodied_segment_episodes` | moving / idle 切段 |
 | `embodied_labeling_tasks` | 生成标注任务清单 |
-| `embodied_convert_dataset` | 转 canonical JSONL / LeRobot v2.1 |
+| `embodied_convert_dataset` | 转 canonical JSONL / LeRobot v2.1 / v3.0（含 stats 与 splits） |
 | `embodied_scaffold_project` | platform / adapter / pipeline 骨架 |
 | `embodied_catalog_index` | 扫描目录、增量编目 |
 | `embodied_catalog_search` | 按文本/格式/型号/episode 数/分数检索 |
 | `embodied_catalog_stats` | 编目汇总 |
 | `embodied_catalog_history` | 数据集版本、运行记录与谱系 |
+| `embodied_inspect_media` | image/video/depth/point-cloud/language 模态与可选 ffprobe |
+| `embodied_decode_samples` | rosbag2/MCAP CDR、RLDS 样本解码 |
+| `embodied_apply_annotations` | 标注回写、冲突与覆盖率闭环 |
+| `embodied_storage_pull` | file/http(s)/s3 原子拉取与校验 |
 | `embodied_list_formats` | 支持的格式与检查项 |
 | `embodied_plan_windows` | 训练窗口规划 |
 | `embodied_submit_job` | 后台运行 quality_report / validate_dataset / quality_gate |
@@ -48,6 +52,7 @@ node --test test/*.test.mjs                       # 路径、并发与审批单�
 - `convert_dataset` / `scaffold_project` / `catalog_index` / 带 `out` 的 `labeling_tasks` 在工作区外写入前调用 `approval.request`，只接受 `allowed-once`。
 - 没有审批服务、审批被拒绝或 DSH 为只读模式时，写入不会发生。
 - 异步作业只接受只读分析，不会绕过上述写入审批；`quality_report` 的缓存写入用户缓存目录，不写数据集或工作区。
+- `apply_annotations.out` 与 `storage_pull.destination` 属于写目标，工作区外同样需要一次性审批。
 - MCP 客户端解析 `notifications/progress`；同步质检/校验按 50% 里程碑记日志，宿主也可订阅 `client.onProgress(...)`。
 
 ## 文件

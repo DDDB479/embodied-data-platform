@@ -10,11 +10,31 @@ enumerated by the fallback reader (the official reader handles them).
 from __future__ import annotations
 
 import struct
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
+
+import numpy as np
 
 from ..model import DatasetSummary, EpisodeRecord, FeatureSpec
-from .base import DatasetObject, Detection, FramesUnavailable, guess_kind
+from ..ros2_codec import (
+    CDRError,
+    UnsupportedMessageType,
+    decode_message,
+    flatten_decoded,
+    topic_feature_keys,
+)
+from .base import (
+    DatasetObject,
+    Detection,
+    FrameChunk,
+    FrameLimitExceeded,
+    FramesUnavailable,
+    collect_frame_chunks,
+    guess_kind,
+    resolve_chunk_frames,
+    resolve_max_frames,
+)
 
 MAGIC = b"\x89MCAP0\r\n"
 _OP_HEADER = 0x01
@@ -125,9 +145,9 @@ def _scan_fallback(path: Path) -> dict[str, Any]:
                 info["schemas"][sid] = {"name": name, "encoding": encoding}
             elif code == _OP_CHANNEL:
                 cid, pos = _read_uint16(payload, 0)
-                _schema_id, pos = _read_uint16(payload, pos)
+                schema_id, pos = _read_uint16(payload, pos)
                 topic, pos = _read_string(payload, pos)
-                info["channels"][cid] = {"topic": topic}
+                info["channels"][cid] = {"topic": topic, "schema_id": schema_id}
                 info["counts"].setdefault(topic, 0)
             elif code == _OP_MESSAGE:
                 _cid, pos = _read_uint16(payload, 0)
@@ -190,16 +210,177 @@ def _read_with_mcap(path: Path) -> dict[str, Any]:
     return info
 
 
+def _select_topics(types: dict[str, str], features: Sequence[str] | None) -> list[str]:
+    candidates = [topic for topic, type_name in types.items() if topic_feature_keys(type_name)]
+    if features is None:
+        return sorted(candidates)
+    selected: list[str] = []
+    for requested in features:
+        for topic in candidates:
+            if topic == requested or topic.startswith(f"{requested}.") or requested.startswith(f"{topic}."):
+                if topic not in selected:
+                    selected.append(topic)
+    return selected
+
+
 class MCAPDataset(DatasetObject):
     def __init__(self, root: Path, summary: DatasetSummary) -> None:
-        super().__init__(root, summary, capabilities={"streams", "episodes"})
+        capabilities = {"streams", "episodes"}
+        if _mcap_module() is not None and summary.meta.get("topic_types"):
+            capabilities.update({"frames", "cdr"})
+        super().__init__(root, summary, capabilities=capabilities)
 
     @staticmethod
     def optional_dependencies() -> dict[str, str]:
-        return {"mcap": "full MCAP reading (fallback reader is built in)"}
+        return {"mcap": "full MCAP reading and CDR message decoding (fallback metadata reader is built in)"}
 
-    def frames(self, episodes=None, features=None, *, max_frames=None):  # noqa: ANN001 - protocol signature
-        raise FramesUnavailable("MCAP stores message streams; decode topics with their ROS/CDR schema first")
+    def frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        max_frames: int | None = None,
+    ) -> tuple[list[int], dict[str, np.ndarray]]:
+        return collect_frame_chunks(
+            self.iter_frames(episodes, features, max_frames=max_frames),
+            max_frames=max_frames,
+        )
+
+    def iter_frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        chunk_frames: int | None = None,
+        max_frames: int | None = None,
+    ) -> Iterator[FrameChunk]:
+        module = _mcap_module()
+        if module is None:
+            raise FramesUnavailable(
+                "MCAP frame decoding requires the mcap package",
+                install="pip install 'embodied-core[mcap]'",
+            )
+        from mcap.reader import make_reader  # type: ignore
+
+        encodings = {str(key): str(value).lower() for key, value in (self.summary.meta.get("topic_encodings") or {}).items()}
+        types = {
+            str(key): str(value)
+            for key, value in (self.summary.meta.get("topic_types") or {}).items()
+            if encodings.get(str(key), "cdr") in ("", "cdr", "ros2", "ros2msg")
+        }
+        selected = _select_topics(types, features)
+        if not selected:
+            raise FramesUnavailable("no CDR-decodable MCAP topics matched the request")
+        wanted = set(episodes) if episodes is not None else None
+        size = resolve_chunk_frames(chunk_frames)
+        limit = resolve_max_frames(max_frames)
+        files = _mcap_files(self.root)
+        total = 0
+        emitted = False
+        seen: dict[int, int] = {}
+        for episode_index, path in enumerate(files):
+            if wanted is not None and episode_index not in wanted:
+                continue
+            handles = [path.open("rb") for _ in selected]
+            try:
+                readers = [make_reader(handle) for handle in handles]
+                generators = {
+                    topic: readers[position].iter_messages(topics=[topic], log_time_order=True)
+                    for position, topic in enumerate(selected)
+                }
+                finished: set[str] = set()
+                while len(finished) < len(selected):
+                    buckets: dict[str, list[Any]] = {}
+                    for topic in selected:
+                        if topic in finished:
+                            buckets[topic] = []
+                            continue
+                        rows = []
+                        for _ in range(size):
+                            try:
+                                rows.append(next(generators[topic]))
+                            except StopIteration:
+                                finished.add(topic)
+                                break
+                        buckets[topic] = rows
+                    if not any(buckets.values()):
+                        if len(finished) >= len(selected):
+                            break
+                        continue
+                    count = max(len(rows) for rows in buckets.values())
+                    merged: dict[str, list[np.ndarray]] = defaultdict(list)
+                    for topic, rows in buckets.items():
+                        for _schema, _channel, message in rows:
+                            try:
+                                decoded = decode_message(types.get(topic, ""), message.data)
+                                flat = flatten_decoded(decoded, topic)
+                            except (CDRError, UnsupportedMessageType, ValueError):
+                                continue
+                            for key, values in flat.items():
+                                merged[key].append(np.asarray(values, dtype=np.float64).reshape(-1))
+                    if not merged:
+                        continue
+                    columns: dict[str, np.ndarray] = {}
+                    for key, values in merged.items():
+                        width = max((item.size for item in values), default=1)
+                        matrix = np.full((count, width), np.nan, dtype=np.float64)
+                        for row_index, value in enumerate(values[:count]):
+                            matrix[row_index, : value.size] = value
+                        columns[key] = matrix
+                    total += count
+                    if limit and total > limit:
+                        raise FrameLimitExceeded(limit, total)
+                    frame_ids = [episode_index] * count
+                    offsets = {episode_index: seen.get(episode_index, 0)}
+                    seen[episode_index] = seen.get(episode_index, 0) + count
+                    emitted = True
+                    yield FrameChunk(frame_ids, columns, offsets)
+            finally:
+                for handle in handles:
+                    handle.close()
+        if not emitted:
+            raise FramesUnavailable("no MCAP messages decoded from the selected CDR topics")
+
+    def topic_samples(
+        self,
+        topic: str,
+        *,
+        episode: int | None = None,
+        limit: int = 5,
+        include_arrays: bool = False,
+    ) -> dict[str, Any]:
+        module = _mcap_module()
+        if module is None:
+            raise FramesUnavailable(
+                "MCAP message samples require the mcap package",
+                install="pip install 'embodied-core[mcap]'",
+            )
+        from mcap.reader import make_reader  # type: ignore
+
+        types = {str(key): str(value) for key, value in (self.summary.meta.get("topic_types") or {}).items()}
+        type_name = types.get(topic)
+        if not type_name:
+            raise KeyError(f"unknown topic {topic!r}")
+        encoding = str((self.summary.meta.get("topic_encodings") or {}).get(topic) or "").lower()
+        if encoding not in ("", "cdr", "ros2", "ros2msg"):
+            raise FramesUnavailable(f"topic {topic!r} uses message encoding {encoding!r}; only CDR is decoded")
+        files = _mcap_files(self.root)
+        if episode is not None:
+            if episode < 0 or episode >= len(files):
+                raise ValueError(f"episode {episode} is out of range")
+            files = [files[episode]]
+        samples = []
+        for path in files:
+            with path.open("rb") as handle:
+                reader = make_reader(handle)
+                for _schema, _channel, message in reader.iter_messages(topics=[topic], log_time_order=True):
+                    decoded = decode_message(type_name, message.data)
+                    body = decoded.to_dict(include_arrays=include_arrays)
+                    body["log_time_ns"] = int(message.log_time)
+                    samples.append(body)
+                    if len(samples) >= max(1, int(limit)):
+                        break
+        return {"topic": topic, "type": type_name, "samples": samples}
 
 
 def load(root: Path, detection: Detection | None = None) -> MCAPDataset:
@@ -210,6 +391,8 @@ def load(root: Path, detection: Detection | None = None) -> MCAPDataset:
     notes: list[str] = []
     meta: dict[str, Any] = {"files": [f.name for f in files]}
     total_counts: dict[str, int] = {}
+    topic_types: dict[str, str] = {}
+    topic_encodings: dict[str, str] = {}
     start_s: float | None = None
     end_s: float | None = None
     reader_name = "mcap-python" if module is not None else "stdlib-fallback"
@@ -231,6 +414,13 @@ def load(root: Path, detection: Detection | None = None) -> MCAPDataset:
             duration = None
         for topic, count in (info.get("counts") or {}).items():
             total_counts[topic] = total_counts.get(topic, 0) + int(count)
+        schemas = info.get("schemas") or {}
+        for channel in (info.get("channels") or {}).values():
+            topic = str(channel.get("topic") or "")
+            schema = schemas.get(channel.get("schema_id")) or {}
+            if topic and schema.get("name"):
+                topic_types[topic] = str(schema["name"])
+                topic_encodings[topic] = str(schema.get("encoding") or "")
         topics = sorted(info.get("counts") or {})
         hint = "chunked messages not enumerated by the fallback reader" if info.get("chunked") and module is None else None
         if hint:
@@ -246,8 +436,37 @@ def load(root: Path, detection: Detection | None = None) -> MCAPDataset:
             )
         )
     for topic in sorted(total_counts):
-        features.append(FeatureSpec(key=topic, dtype="message", shape=(), kind=guess_kind(topic)))
+        type_name = topic_types.get(topic, "")
+        decoded_features = topic_feature_keys(type_name)
+        features.append(
+            FeatureSpec(
+                key=topic,
+                dtype="message",
+                shape=(),
+                kind=guess_kind(topic),
+                extra={
+                    "type": type_name or None,
+                    "encoding": topic_encodings.get(topic) or None,
+                    "messages": total_counts[topic],
+                    "decoded_features": decoded_features,
+                    "cdr_decodable": bool(decoded_features)
+                    and str(topic_encodings.get(topic) or "").lower() in ("", "cdr", "ros2", "ros2msg"),
+                },
+            )
+        )
     meta["topic_counts"] = total_counts
+    meta["topic_types"] = topic_types
+    meta["topic_encodings"] = topic_encodings
+    meta["topics"] = [
+        {
+            "topic": topic,
+            "type": topic_types.get(topic),
+            "encoding": topic_encodings.get(topic),
+            "messages": total_counts[topic],
+            "decoded_features": topic_feature_keys(topic_types.get(topic, "")),
+        }
+        for topic in sorted(total_counts)
+    ]
     meta["reader"] = reader_name
     if start_s is not None and end_s is not None:
         meta["time_window_s"] = [start_s, end_s]

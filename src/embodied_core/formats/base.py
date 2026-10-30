@@ -26,6 +26,8 @@ STATE_PREFIXES = ("observation.state", "observation/joint", "state", "qpos", "pr
 ACTION_PREFIXES = ("action", "actions", "ctrl", "command")
 IMAGE_HINTS = ("image", "rgb", "depth", "camera", "video")
 LANGUAGE_HINTS = ("language", "instruction", "task", "prompt", "caption")
+DEPTH_HINTS = ("depth", "disparity", "tof", "range_image")
+POINT_CLOUD_HINTS = ("point_cloud", "pointcloud", "points", "lidar", "point_cloud2")
 
 DEFAULT_CHUNK_FRAMES = 50_000
 DEFAULT_MAX_FRAMES = 2_000_000
@@ -126,6 +128,10 @@ class Detection:
 def guess_kind(key: str, shape: Sequence[int] | None = None, dtype: str = "") -> str:
     """Classify a feature key into the canonical kinds used by checks and QC."""
     low = key.lower()
+    if any(h in low for h in POINT_CLOUD_HINTS):
+        return "point_cloud"
+    if any(h in low for h in DEPTH_HINTS):
+        return "depth"
     if any(h in low for h in IMAGE_HINTS) and not low.endswith("_shape"):
         return "image" if "image" in low or "rgb" in low or "depth" in low else "video"
     if any(h in low for h in LANGUAGE_HINTS):

@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from . import __version__
+from .annotations import apply_annotation_feedback
 from .catalog import index as catalog_index
 from .catalog import history as catalog_history
 from .catalog import search as catalog_search
@@ -37,11 +38,15 @@ from .convert import ConversionError, convert
 from .formats.base import FrameLimitExceeded, FramesUnavailable
 from .gate import evaluate_quality_gate
 from .jobs import Job, JobCancelled, JobManager, JobNotFound
+from .media import probe_dataset_media
+from .platform import capability_report
 from .model import to_jsonable
 from .quality import build_labeling_tasks, compute_dataset_stats, detect_anomalies, make_windows, segment_by_motion
 from .registry import UnsupportedFormat, describe_formats, detect_dataset, open_dataset
 from .reports import quality_report
+from .ros2_codec import CDRError, UnsupportedMessageType
 from .scaffold import scaffold
+from .storage import StorageError, StorageUnavailable, pull as storage_pull
 from .validate import CHECKS, DEFAULT_CHECKS, validate
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -62,6 +67,10 @@ _ERROR_CODES: tuple[tuple[type[BaseException], str], ...] = (
     (ConversionError, "conversion_failed"),
     (FrameLimitExceeded, "frame_limit_exceeded"),
     (FramesUnavailable, "frames_unavailable"),
+    (UnsupportedMessageType, "unsupported_message_type"),
+    (CDRError, "decoder_error"),
+    (StorageUnavailable, "storage_unavailable"),
+    (StorageError, "storage_error"),
     (KeyError, "bad_arguments"),
     (ValueError, "bad_arguments"),
 )
@@ -352,6 +361,9 @@ def tool_convert(arguments: dict[str, Any]) -> Any:
         target=arguments.get("target", "jsonl"),
         overwrite=bool(arguments.get("overwrite", False)),
         episodes=arguments.get("episodes") or None,
+        train_ratio=float(arguments.get("train_ratio", 0.9)),
+        validation_ratio=float(arguments.get("validation_ratio", 0.0)),
+        test_ratio=float(arguments.get("test_ratio", 0.0)),
     )
 
 
@@ -400,8 +412,62 @@ def tool_catalog_history(arguments: dict[str, Any]) -> Any:
     )
 
 
+def tool_media(arguments: dict[str, Any]) -> Any:
+    dataset = open_dataset(arguments["path"])
+    try:
+        return probe_dataset_media(
+            dataset,
+            max_videos=int(arguments.get("max_videos", 4)),
+            probe=bool(arguments.get("probe", True)),
+        )
+    finally:
+        dataset.close()
+
+
+def tool_decode_samples(arguments: dict[str, Any]) -> Any:
+    dataset = open_dataset(arguments["path"])
+    try:
+        if hasattr(dataset, "topic_samples"):
+            topic = arguments.get("topic")
+            if not isinstance(topic, str) or not topic:
+                raise ValueError("topic is required for stream datasets")
+            return dataset.topic_samples(
+                topic,
+                episode=arguments.get("episode"),
+                limit=int(arguments.get("limit", 5)),
+                include_arrays=bool(arguments.get("include_arrays", False)),
+            )
+        if hasattr(dataset, "episode_samples"):
+            return dataset.episode_samples(episode=arguments.get("episode"), limit=int(arguments.get("limit", 1)))
+        raise FramesUnavailable(f"{dataset.summary.format} does not expose decoded samples")
+    finally:
+        dataset.close()
+
+
+def tool_apply_annotations(arguments: dict[str, Any]) -> Any:
+    manifest = arguments.get("manifest")
+    if manifest is None:
+        raise ValueError("manifest is required")
+    labels = arguments.get("labels") or []
+    return apply_annotation_feedback(manifest, labels, out=arguments.get("out"), previous=arguments.get("previous"))
+
+
+def tool_storage_pull(arguments: dict[str, Any]) -> Any:
+    return storage_pull(
+        arguments["uri"],
+        arguments["destination"],
+        overwrite=bool(arguments.get("overwrite", False)),
+        retries=int(arguments.get("retries", 2)),
+        timeout_s=float(arguments.get("timeout_s", 30.0)),
+    )
+
+
 def tool_formats(arguments: dict[str, Any]) -> Any:
-    return {"formats": describe_formats(), "checks": {"default": DEFAULT_CHECKS, "available": sorted(CHECKS)}}
+    return {
+        "formats": describe_formats(),
+        "checks": {"default": DEFAULT_CHECKS, "available": sorted(CHECKS)},
+        "platform": capability_report(),
+    }
 
 
 def tool_windows(arguments: dict[str, Any]) -> Any:
@@ -530,15 +596,18 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "convert_dataset",
-        "description": "Convert a dataset to another layout: 'jsonl' (canonical, dependency-free) or 'lerobot' (v2.1 parquet, needs pyarrow). Numeric features only; camera streams are reported, not re-encoded.",
+        "description": "Convert a dataset to another layout: 'jsonl' (canonical), 'lerobot' (v2.1) or 'lerobot-v3' (v3.0 with meta/stats.json and train/val/test splits). Numeric features only; camera streams are reported, not re-encoded.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "source": {"type": "string"},
                 "destination": {"type": "string"},
-                "target": {"type": "string", "enum": ["jsonl", "lerobot"], "default": "jsonl"},
+                "target": {"type": "string", "enum": ["jsonl", "lerobot", "lerobot-v3"], "default": "jsonl"},
                 "episodes": {"type": "array", "items": {"type": "integer"}},
                 "overwrite": {"type": "boolean", "default": False},
+                "train_ratio": {"type": "number", "default": 0.9, "description": "LeRobot v3 split ratio"},
+                "validation_ratio": {"type": "number", "default": 0.0},
+                "test_ratio": {"type": "number", "default": 0.0},
             },
             "required": ["source", "destination"],
         },
@@ -617,6 +686,67 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["db"],
         },
         "handler": tool_catalog_history,
+    },
+    {
+        "name": "inspect_media",
+        "description": "Inventory image/video/depth/point-cloud/language modalities and optionally probe video files with ffprobe. ffprobe is optional; its absence returns a structured install hint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "max_videos": {"type": "integer", "default": 4},
+                "probe": {"type": "boolean", "default": True},
+            },
+            "required": ["path"],
+        },
+        "handler": tool_media,
+    },
+    {
+        "name": "decode_samples",
+        "description": "Decode bounded message/episode samples: rosbag2/MCAP CDR topics (including depth and point-cloud metadata) or RLDS step samples. Use include_arrays only for small point clouds/images.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "topic": {"type": "string"},
+                "episode": {"type": "integer"},
+                "limit": {"type": "integer", "default": 5},
+                "include_arrays": {"type": "boolean", "default": False},
+            },
+            "required": ["path"],
+        },
+        "handler": tool_decode_samples,
+    },
+    {
+        "name": "apply_annotations",
+        "description": "Reconcile reviewer labels with a labeling-task manifest (stable task_id, last-wins duplicates), report coverage/conflicts, and optionally write the reviewed JSON/JSONL atomically.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "manifest": {"type": "object", "description": "Manifest object from labeling_tasks, or a path"},
+                "labels": {"type": "array", "items": {"type": "object"}},
+                "previous": {"type": "string", "description": "Optional prior labels JSON/JSONL for idempotent append"},
+                "out": {"type": "string", "description": "Optional reviewed JSON/JSONL output path"},
+            },
+            "required": ["manifest"],
+        },
+        "handler": tool_apply_annotations,
+    },
+    {
+        "name": "storage_pull",
+        "description": "Atomically materialize a local/file/http(s)/s3 object or prefix with checksums, retries and a source manifest. S3 requires boto3.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string"},
+                "destination": {"type": "string"},
+                "overwrite": {"type": "boolean", "default": False},
+                "retries": {"type": "integer", "default": 2},
+                "timeout_s": {"type": "number", "default": 30.0},
+            },
+            "required": ["uri", "destination"],
+        },
+        "handler": tool_storage_pull,
     },
     {
         "name": "list_formats",
@@ -699,7 +829,14 @@ _BY_NAME: dict[str, dict[str, Any]] = {tool["name"]: tool for tool in TOOLS}
 # Hosts such as Codex treat an MCP tool without safety annotations as a write
 # action and require approval before calling it. Keep these declarations close
 # to the registry so the server's advertised behavior stays auditable.
-_WRITE_TOOLS = {"labeling_tasks", "convert_dataset", "scaffold_project", "catalog_index"}
+_WRITE_TOOLS = {
+    "labeling_tasks",
+    "convert_dataset",
+    "scaffold_project",
+    "catalog_index",
+    "apply_annotations",
+    "storage_pull",
+}
 
 
 def _annotations(tool: dict[str, Any]) -> dict[str, bool]:
@@ -707,8 +844,8 @@ def _annotations(tool: dict[str, Any]) -> dict[str, bool]:
     read_only = name not in _WRITE_TOOLS
     return {
         "readOnlyHint": read_only,
-        "destructiveHint": name in {"labeling_tasks", "convert_dataset", "scaffold_project"},
-        "openWorldHint": False,
+        "destructiveHint": name in {"labeling_tasks", "convert_dataset", "scaffold_project", "apply_annotations"},
+        "openWorldHint": name == "storage_pull",
     }
 
 
@@ -738,7 +875,19 @@ def call_tool(
         else:
             result = tool["handler"](arguments or {})
         return {"content": [_json_text(result)], "isError": False}
-    except (FileNotFoundError, UnsupportedFormat, ConversionError, FileExistsError, ValueError, KeyError) as exc:
+    except (
+        FileNotFoundError,
+        UnsupportedFormat,
+        ConversionError,
+        FileExistsError,
+        FrameLimitExceeded,
+        FramesUnavailable,
+        UnsupportedMessageType,
+        CDRError,
+        StorageError,
+        ValueError,
+        KeyError,
+    ) as exc:
         return {"content": [_error_text(exc)], "isError": True}
     except Exception as exc:  # never leak a traceback to the client
         return {
@@ -780,7 +929,10 @@ def handle_message(
                 "For long scans, submit_job starts a background quality_report, validate_dataset or quality_gate "
                 "run; poll job_status and fetch the result with include_result=true. quality_report is "
                 "fingerprint-cached and reads frames in bounded chunks. The catalog stores immutable versions, "
-                "runs and lineage; inspect them with catalog_history."
+                "runs and lineage; inspect them with catalog_history. rosbag2/MCAP CDR and RLDS TFRecord samples "
+                "are available through decode_samples; inspect_media inventories depth/point-cloud/language/video "
+                "modalities. apply_annotations reconciles reviewer labels, and storage_pull materializes object-store "
+                "datasets atomically. Convert with target=lerobot-v3 for stats and train/val/test splits."
             ),
         }
     elif method in ("notifications/initialized", "initialized"):

@@ -1,6 +1,6 @@
 # DSH 插件
 
-`packages/dsh-plugin` 是给 DeepSeek Harness 的封装：把 19 个 MCP 工具注册成**原生 agent 工具**（外加一个不依赖 Python 的 `embodied_self_check`），再注入一段工作流提示词。插件本身不实现任何数据逻辑——它启动 `python -m embodied_core.mcp_server` 并做 JSON-RPC 桥接，所以模型换成 Codex / Claude Code 时，行为完全一致。
+`packages/dsh-plugin` 是给 DeepSeek Harness 的封装：把 23 个 MCP 工具注册成**原生 agent 工具**（外加一个不依赖 Python 的 `embodied_self_check`），再注入一段工作流提示词。插件本身不实现任何数据逻辑——它启动 `python -m embodied_core.mcp_server` 并做 JSON-RPC 桥接，所以模型换成 Codex / Claude Code 时，行为完全一致。
 
 ## 为什么还要插件
 
@@ -59,7 +59,7 @@ pnpm add dsh-embodied-data
       - /abs/path/to/deps
 ```
 
-改完重启 Harness（或重新加载 profile）。工具列表里应出现 20 个以 `embodied_` 开头的工具；第一次先调 `embodied_self_check`，它会直接告出解释器、`PYTHONPATH` 和 MCP 进程状态。
+改完重启 Harness（或重新加载 profile）。工具列表里应出现 24 个以 `embodied_` 开头的工具；第一次先调 `embodied_self_check`，它会直接告出解释器、`PYTHONPATH` 和 MCP 进程状态。
 
 ## 配置项
 
@@ -112,7 +112,7 @@ node scripts/probe.mjs \
 ok            yes
 python root   D:/具身平台插件开发
 import path   D:/具身平台插件开发/src
-tools         20
+tools         24
               embodied_self_check, embodied_detect_dataset, ...
 prompt        embodied-data:toolbox
 detect        {"format":"lerobot","version":"v2.1","confidence":0.98,...}
@@ -139,7 +139,7 @@ node tools/check_clean_install.mjs \
 ## 写入安全
 
 - 只读工具（detect / summarize / validate / quality / segment / catalog search…）声明为可并发。
-- 写工具（`convert_dataset`、`scaffold_project`、`catalog_index`、带 `out` 的 `labeling_tasks`）不声明并发，DSH 会串行调度。
+- 写工具（`convert_dataset`、`scaffold_project`、`catalog_index`、`apply_annotations`、`storage_pull`、带 `out` 的 `labeling_tasks`）不声明并发，DSH 会串行调度。
 - 写目标不在 DSH 工作区内时，插件通过 `ctx.get('approval').request(...)` 申请一次 `allowed-once`；拒绝、不可用或只读模式都会阻止写入。
 - 相对路径参数统一按会话工作区解析，不再相对 Python 子进程的安装目录。
 
@@ -151,6 +151,8 @@ node tools/check_clean_install.mjs \
 - `quality_report` 的缓存写在用户缓存目录，不在数据集或工作区里产生新文件；`refresh_cache=true` 可强制重算。
 - `quality_gate` 的规则可内联传入；CLI 额外支持 `--rules rules.json|rules.toml`，便于把同一套策略放进 CI。
 - 编目工具使用 schema v2；`catalog_history` 可直接读取版本、运行和谱系，不需要重新扫描数据盘。
+- `inspect_media` / `decode_samples` 是只读工具；前者可选调用 ffprobe，后者可查看 rosbag2/MCAP CDR 或 RLDS 样本。
+- `apply_annotations` 的 `out` 和 `storage_pull` 的 `destination` 都走工作区写审批；对象存储下载本身有 SHA-256 和来源 manifest。
 
 ## 与 MCP 的关系
 

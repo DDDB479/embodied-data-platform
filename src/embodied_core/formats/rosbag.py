@@ -12,11 +12,32 @@ from __future__ import annotations
 
 import sqlite3
 import struct
+from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Sequence
+
+import numpy as np
 
 from ..model import DatasetSummary, EpisodeRecord, FeatureSpec
-from .base import DatasetObject, Detection, FramesUnavailable, guess_kind
+from ..ros2_codec import (
+    CDRError,
+    UnsupportedMessageType,
+    decode_message,
+    flatten_decoded,
+    supported_message_types,
+    topic_feature_keys,
+)
+from .base import (
+    DatasetObject,
+    Detection,
+    FrameChunk,
+    FrameLimitExceeded,
+    FramesUnavailable,
+    collect_frame_chunks,
+    guess_kind,
+    resolve_chunk_frames,
+    resolve_max_frames,
+)
 
 ROS1_MAGIC = b"#ROSBAG V2.0\n"
 _OP_MSG_DATA = 0x02
@@ -85,12 +106,175 @@ def detect(root: Path) -> Detection | None:
 # --------------------------------------------------------------------------
 # rosbag2
 # --------------------------------------------------------------------------
+def _select_topics(types: dict[str, str], features: Sequence[str] | None) -> list[str]:
+    candidates = [
+        topic
+        for topic, type_name in types.items()
+        if topic_feature_keys(type_name) or str(type_name or "").endswith("String")
+    ]
+    if features is None:
+        return sorted(candidates)
+    selected: list[str] = []
+    for requested in features:
+        matches = [
+            topic
+            for topic in candidates
+            if topic == requested or topic.startswith(f"{requested}.") or requested.startswith(f"{topic}.")
+        ]
+        for topic in matches:
+            if topic not in selected:
+                selected.append(topic)
+    return selected
+
+
 class Rosbag2Dataset(DatasetObject):
     def __init__(self, root: Path, summary: DatasetSummary) -> None:
-        super().__init__(root, summary, capabilities={"streams", "episodes", "sqlite"})
+        super().__init__(root, summary, capabilities={"streams", "episodes", "sqlite", "frames", "cdr"})
 
-    def frames(self, episodes=None, features=None, *, max_frames=None):  # noqa: ANN001
-        raise FramesUnavailable("rosbag2 messages are CDR-encoded; decode a topic with its ROS message type first")
+    @staticmethod
+    def optional_dependencies() -> dict[str, str]:
+        return {}
+
+    def frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        max_frames: int | None = None,
+    ) -> tuple[list[int], dict[str, np.ndarray]]:
+        return collect_frame_chunks(
+            self.iter_frames(episodes, features, max_frames=max_frames),
+            max_frames=max_frames,
+        )
+
+    def iter_frames(
+        self,
+        episodes: Sequence[int] | None = None,
+        features: Sequence[str] | None = None,
+        *,
+        chunk_frames: int | None = None,
+        max_frames: int | None = None,
+    ) -> Iterator[FrameChunk]:
+        dbs = _ros2_dbs(self.root)
+        wanted = set(episodes) if episodes is not None else None
+        size = resolve_chunk_frames(chunk_frames)
+        limit = resolve_max_frames(max_frames)
+        types = {
+            str(item.get("topic")): str(item.get("type") or "")
+            for item in self.summary.meta.get("topics", [])
+            if str(item.get("serialization_format") or "cdr").lower() in ("", "cdr", "ros2")
+        }
+        selected = _select_topics(types, features)
+        if not selected:
+            raise FramesUnavailable("no CDR-decodable topics matched the request")
+        total = 0
+        emitted = False
+        seen: dict[int, int] = {}
+        for episode_index, db in enumerate(dbs):
+            if wanted is not None and episode_index not in wanted:
+                continue
+            connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            connection.row_factory = sqlite3.Row
+            try:
+                topic_ids: dict[str, int] = {}
+                for row in connection.execute("SELECT id, name FROM topics"):
+                    topic_ids[str(row["name"])] = int(row["id"])
+                selected = [topic for topic in selected if topic in topic_ids]
+                if not selected:
+                    continue
+                offset = 0
+                while True:
+                    chunks: dict[str, list[Any]] = {}
+                    any_rows = False
+                    for topic in selected:
+                        rows = connection.execute(
+                            "SELECT timestamp, data FROM messages WHERE topic_id=? ORDER BY id LIMIT ? OFFSET ?",
+                            (topic_ids[topic], size, offset),
+                        ).fetchall()
+                        if rows:
+                            any_rows = True
+                        chunks[topic] = rows
+                    if not any_rows:
+                        break
+                    count = max(len(rows) for rows in chunks.values())
+                    merged: dict[str, list[np.ndarray]] = defaultdict(list)
+                    for topic, rows in chunks.items():
+                        type_name = types.get(topic, "")
+                        for row in rows:
+                            try:
+                                decoded = decode_message(type_name, bytes(row["data"]))
+                                flat = flatten_decoded(decoded, topic)
+                            except (CDRError, UnsupportedMessageType, ValueError):
+                                continue
+                            for key, values in flat.items():
+                                merged[key].append(np.asarray(values, dtype=np.float64).reshape(-1))
+                    if not merged:
+                        offset += size
+                        continue
+                    columns: dict[str, np.ndarray] = {}
+                    for key, values in merged.items():
+                        width = max((item.size for item in values), default=1)
+                        matrix = np.full((count, width), np.nan, dtype=np.float64)
+                        for row_index, value in enumerate(values[:count]):
+                            matrix[row_index, : value.size] = value
+                        columns[key] = matrix
+                    total += count
+                    if limit and total > limit:
+                        raise FrameLimitExceeded(limit, total)
+                    frame_ids = [episode_index] * count
+                    offsets = {episode_index: seen.get(episode_index, 0)}
+                    seen[episode_index] = seen.get(episode_index, 0) + count
+                    emitted = True
+                    offset += size
+                    yield FrameChunk(frame_ids, columns, offsets)
+            finally:
+                connection.close()
+        if not emitted:
+            raise FramesUnavailable(
+                "no messages decoded; supported ROS 2 types include " + ", ".join(supported_message_types()[:12])
+            )
+
+    def topic_samples(
+        self,
+        topic: str,
+        *,
+        episode: int | None = None,
+        limit: int = 5,
+        include_arrays: bool = False,
+    ) -> dict[str, Any]:
+        dbs = _ros2_dbs(self.root)
+        if episode is not None:
+            if episode < 0 or episode >= len(dbs):
+                raise ValueError(f"episode {episode} is out of range")
+            dbs = [dbs[episode]]
+        topics_meta = {str(item.get("topic")): item for item in self.summary.meta.get("topics", [])}
+        metadata = topics_meta.get(topic)
+        type_name = str(metadata.get("type") or "") if metadata else None
+        if not type_name:
+            raise KeyError(f"unknown topic {topic!r}")
+        serialization = str(metadata.get("serialization_format") or "cdr").lower() if metadata else "cdr"
+        if serialization not in ("", "cdr", "ros2"):
+            raise FramesUnavailable(f"topic {topic!r} uses serialization {serialization!r}; only CDR is decoded")
+        samples = []
+        for db in dbs:
+            connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            connection.row_factory = sqlite3.Row
+            try:
+                row = connection.execute("SELECT id FROM topics WHERE name=?", (topic,)).fetchone()
+                if row is None:
+                    continue
+                messages = connection.execute(
+                    "SELECT timestamp, data FROM messages WHERE topic_id=? ORDER BY id LIMIT ?",
+                    (int(row[0]), max(1, int(limit))),
+                ).fetchall()
+                for message in messages:
+                    decoded = decode_message(type_name, bytes(message["data"]))
+                    body = decoded.to_dict(include_arrays=include_arrays)
+                    body["timestamp_ns"] = int(message["timestamp"])
+                    samples.append(body)
+            finally:
+                connection.close()
+        return {"topic": topic, "type": type_name, "samples": samples}
 
     def topics(self) -> list[dict[str, Any]]:
         return [f.extra for f in self.summary.features]
@@ -110,19 +294,39 @@ def _load_ros2(root: Path) -> DatasetSummary:
             notes.append(f"{db.name}: {exc}")
             continue
         try:
-            rows = list(conn.execute("SELECT id, name, type FROM topics"))
+            topic_columns = {row[1] for row in conn.execute("PRAGMA table_info(topics)")}
+            selection = "id, name, type" + (", serialization_format" if "serialization_format" in topic_columns else "")
+            rows = list(conn.execute(f"SELECT {selection} FROM topics"))
             counts = dict(conn.execute("SELECT topic_id, COUNT(*) FROM messages GROUP BY topic_id"))
             window = conn.execute("SELECT MIN(timestamp), MAX(timestamp) FROM messages").fetchone()
-            for topic_id, name, type_name in rows:
+            for row in rows:
+                topic_id, name, type_name = row[0], row[1], row[2]
+                serialization = row[3] if len(row) > 3 else "cdr"
                 count = int(counts.get(topic_id, 0))
-                topic_rows.append({"topic": name, "type": type_name, "messages": count})
+                decoded_features = topic_feature_keys(str(type_name or ""))
+                topic_rows.append(
+                    {
+                        "topic": name,
+                        "type": type_name,
+                        "serialization_format": serialization,
+                        "messages": count,
+                        "decoded_features": decoded_features,
+                        "cdr_decodable": bool(decoded_features) or str(type_name or "").endswith("String"),
+                    }
+                )
                 features.append(
                     FeatureSpec(
                         key=str(name),
                         dtype="message",
                         shape=(),
                         kind=guess_kind(str(name) if name else ""),
-                        extra={"type": type_name, "messages": count},
+                        extra={
+                            "type": type_name,
+                            "serialization_format": serialization,
+                            "messages": count,
+                            "decoded_features": decoded_features,
+                            "cdr_decodable": bool(decoded_features) or str(type_name or "").endswith("String"),
+                        },
                     )
                 )
             start_ns, end_ns = window if window else (None, None)

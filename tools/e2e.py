@@ -8,11 +8,14 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import threading
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 FIXTURES = Path(os.environ.get("EMBODIED_FIXTURES", HERE.parent / ".devtools" / "fixtures"))
 PYTHON = sys.executable
+sys.path.insert(0, str(HERE.parent))
 
 results: list[tuple[str, bool, str]] = []
 
@@ -29,6 +32,7 @@ def check(label: str, fn):
 
 from embodied_core import open_dataset, describe_formats, detect_dataset, validate  # noqa: E402
 from embodied_core.quality import compute_feature_stats, detect_anomalies, segment_by_motion  # noqa: E402
+from tests import support  # noqa: E402
 
 EXPECTED = {
     "canonical": "embodied-jsonl",
@@ -230,6 +234,93 @@ def t_streaming_and_gate():
     return f"chunks={len(chunks)} gate=pass reject={rejected['gate']['failures'][0]['code']}"
 
 
+def t_cdr_and_rlds_decoding():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        bag = support.write_rosbag2_cdr(root / "bag", messages=3)
+        dataset = open_dataset(bag)
+        try:
+            ids, columns = dataset.frames(features=["/joint_states"])
+            assert len(ids) == 3, len(ids)
+            assert columns["/joint_states.position"].shape == (3, 3), columns
+            sample = dataset.topic_samples("/instruction", limit=1)
+            assert "red cube" in sample["samples"][0]["text"]["data"], sample
+        finally:
+            dataset.close()
+        rlds = support.write_rlds_sequence(root / "rlds", episodes=1, steps=4)
+        dataset = open_dataset(rlds)
+        try:
+            ids, columns = dataset.frames()
+            assert len(ids) == 4, len(ids)
+            assert columns["steps/action"].shape == (4, 3), columns
+        finally:
+            dataset.close()
+    return "rosbag2 CDR + RLDS SequenceExample"
+
+
+def t_lerobot_v3_and_platform():
+    from embodied_core.annotations import apply_annotation_feedback
+    from embodied_core.api import create_server
+    from embodied_core.catalog import index
+    from embodied_core.convert import convert
+    from embodied_core.media import probe_dataset_media
+    from embodied_core.storage import pull
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        target = root / "v3"
+        converted = convert(
+            FIXTURES / "canonical",
+            target,
+            target="lerobot-v3",
+            train_ratio=0.5,
+            validation_ratio=0.5,
+        )
+        assert converted["validation"]["ok"], converted["validation"]
+        assert (target / "meta" / "stats.json").is_file()
+        assert converted["splits"] == {"train": "0:1", "validation": "1:2"}, converted["splits"]
+
+        manifest = support.write_jsonl_dataset(root / "spiky", spikes=True)
+        dataset = open_dataset(manifest)
+        try:
+            media = probe_dataset_media(dataset, probe=False)
+            assert "counts" in media
+            ids, columns = dataset.frames()
+            from embodied_core.quality import build_labeling_tasks, detect_anomalies
+
+            tasks = build_labeling_tasks(dataset.summary, detect_anomalies(ids, columns, fps=dataset.summary.fps), max_tasks=2)
+        finally:
+            dataset.close()
+        labels = [{"task_id": tasks["tasks"][0]["task_id"], "answer": "valid"}]
+        reviewed = apply_annotation_feedback(tasks, labels)
+        assert reviewed["counts"]["valid"] == 1, reviewed
+
+        source = root / "object"
+        source.mkdir()
+        (source / "payload.bin").write_bytes(b"abc")
+        pulled = pull(source, root / "pulled")
+        assert pulled["files"] == 1, pulled
+
+        db = root / "catalog.db"
+        index(target, db)
+        server = create_server(str(db), host="127.0.0.1", port=0, token="e2e")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/v1/datasets?limit=1",
+                headers={"Authorization": "Bearer e2e"},
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read())
+            assert payload["count"] == 1, payload
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+    return "v3 stats/splits + media + annotations + storage + HTTP API"
+
+
 def t_convert_jsonl_roundtrip():
     from embodied_core.convert import convert
 
@@ -298,6 +389,7 @@ def t_scaffold():
 def t_cli():
     commands = [
         ["formats"],
+        ["doctor", "--json"],
         ["detect", str(FIXTURES / "lerobot_v21"), "--json"],
         ["validate", str(FIXTURES / "canonical"), "--json"],
         ["gate", str(FIXTURES / "canonical"), "--expected-fps", "30", "--json"],
@@ -349,7 +441,7 @@ def t_mcp_stdio():
     responses = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     assert len(responses) == 4, [r.get("id") for r in responses]
     tools = responses[1]["result"]["tools"]
-    assert len(tools) == 19, len(tools)
+    assert len(tools) == 23, len(tools)
     detect_payload = json.loads(responses[2]["result"]["content"][0]["text"])
     assert detect_payload["format"] == "rosbag2", detect_payload
     summary_payload = json.loads(responses[3]["result"]["content"][0]["text"])
@@ -378,6 +470,8 @@ for label, fn in [
     ("labeling tasks", t_label),
     ("async jobs", t_async_jobs),
     ("streaming + gate", t_streaming_and_gate),
+    ("CDR + RLDS decode", t_cdr_and_rlds_decoding),
+    ("v0.5 platform", t_lerobot_v3_and_platform),
     ("convert lerobot->jsonl", t_convert_jsonl_roundtrip),
     ("convert jsonl->lerobot", t_convert_lerobot),
     ("catalog", t_catalog),

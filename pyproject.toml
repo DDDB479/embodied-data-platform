@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "embodied-core"
-version = "0.3.0"
-description = "Format-aware toolkit for embodied-AI robotics datasets: detect, validate, QC, catalog, convert, scaffold."
+version = "0.5.0"
+description = "Format-aware platform toolkit for embodied-AI datasets: CDR/RLDS decoding, media inventory, QC, versioned catalog, training export and object storage."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -18,11 +18,13 @@ dependencies = ["numpy>=1.24"]
 parquet = ["pyarrow>=14"]
 hdf5 = ["h5py>=3.9"]
 mcap = ["mcap>=1.1"]
-all = ["pyarrow>=14", "h5py>=3.9", "mcap>=1.1"]
+s3 = ["boto3>=1.34"]
+all = ["pyarrow>=14", "h5py>=3.9", "mcap>=1.1", "boto3>=1.34"]
 
 [project.scripts]
 embodied = "embodied_core.cli:main"
 embodied-mcp = "embodied_core.mcp_server:main"
+embodied-api = "embodied_core.api:main"
 
 [project.urls]
 Homepage = "https://github.com/DDDB479/embodied-data-platform"

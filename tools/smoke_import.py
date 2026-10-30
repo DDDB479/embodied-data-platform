@@ -35,6 +35,8 @@ def t_import():
         open_dataset,
     )
     import embodied_core.catalog  # noqa: F401
+    import embodied_core.annotations  # noqa: F401
+    import embodied_core.api  # noqa: F401
     import embodied_core.cache  # noqa: F401
     import embodied_core.cli  # noqa: F401
     import embodied_core.convert  # noqa: F401
@@ -47,10 +49,15 @@ def t_import():
     import embodied_core.gate  # noqa: F401
     import embodied_core.mcp_server  # noqa: F401
     import embodied_core.jobs  # noqa: F401
+    import embodied_core.media  # noqa: F401
+    import embodied_core.platform  # noqa: F401
     import embodied_core.quality  # noqa: F401
     import embodied_core.reports  # noqa: F401
+    import embodied_core.ros2_codec  # noqa: F401
     import embodied_core.registry  # noqa: F401
     import embodied_core.scaffold  # noqa: F401
+    import embodied_core.storage  # noqa: F401
+    import embodied_core.tfrecord  # noqa: F401
     import embodied_core.validate  # noqa: F401
     return embodied_core.__version__
 

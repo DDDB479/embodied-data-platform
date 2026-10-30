@@ -81,7 +81,7 @@ class FormatTestCase(unittest.TestCase):
     def test_stream_formats_report_why_frames_are_unavailable(self) -> None:
         dataset = open_dataset(self.rosbag)
         self.assertIn("streams", dataset.capabilities)
-        self.assertNotIn("frames", dataset.capabilities)
+        self.assertIn("cdr", dataset.capabilities)
         with self.assertRaises(FramesUnavailable) as caught:
             dataset.frames()
         self.assertTrue(caught.exception.reason)

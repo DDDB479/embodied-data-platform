@@ -9,7 +9,7 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 
 每个工具返回**一个 JSON 文本块**。成功时是业务数据本身；失败时是 `{"error": {"code": "...", "message": "..."}}`，不会抛协议级异常——模型可以读到错误并自行纠正。
 
-`tools/list` 会为每个工具附带 MCP annotations：读工具 `readOnlyHint: true`，写工具 `readOnlyHint: false`。写工具包括 `labeling_tasks`（仅在传 `out` 时落盘）、`convert_dataset`、`scaffold_project` 和 `catalog_index`。支持审批的宿主会据此提示；DSH 插件还会额外把写工具设为串行，并对工作区外目标申请一次性审批。
+`tools/list` 会为每个工具附带 MCP annotations：读工具 `readOnlyHint: true`，写工具 `readOnlyHint: false`。写工具包括 `labeling_tasks`（仅在传 `out` 时落盘）、`convert_dataset`、`scaffold_project`、`catalog_index`、`apply_annotations` 和 `storage_pull`；`storage_pull` 同时标记 `openWorldHint: true`。支持审批的宿主会据此提示；DSH 插件还会把写工具设为串行，并对工作区外目标申请一次性审批。
 
 ## 进度通知与异步作业
 
@@ -172,7 +172,7 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 | `include_segments` | boolean | | 是否为 moving/idle 段生成"描述阶段"任务 |
 | `out` | string | | 同时写入该文件路径 |
 
-返回 `{dataset, task_count, tasks[], instructions}`。`tasks[]` 每项形如：
+返回 `{schema_version, manifest_id, dataset, task_count, tasks[], instructions}`。每个 task 带稳定 `task_id` 和 `status=pending`，`tasks[]` 每项形如：
 
 ```json
 {
@@ -196,11 +196,14 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 | --- | --- | --- | --- |
 | `source` | string | ✓ | 源数据集 |
 | `destination` | string | ✓ | 目标目录 |
-| `target` | string | | `jsonl`（默认，零依赖）或 `lerobot`（v2.1，需要 pyarrow） |
+| `target` | string | | `jsonl`（默认）、`lerobot`（v2.1）或 `lerobot-v3`（v3.0，需要 pyarrow） |
 | `episodes` | int[] | | 只导出这些 episode |
 | `overwrite` | boolean | | 覆盖已存在目录 |
+| `train_ratio` | number | | v3 train 比例，默认 0.9 |
+| `validation_ratio` | number | | v3 validation 比例 |
+| `test_ratio` | number | | v3 test 比例 |
 
-返回 `{target, destination, episodes, frames, features[], dropped_features[]}`——`target` 回显实际写出的布局名（`embodied-jsonl` / `lerobot`）。只导出数值特征；相机流和其它非数值列会被记录在 `dropped_features` 里，而不是假装转过了。
+返回 `{target, destination, episodes, frames, features[], dropped_features[]}`；v3 额外返回 `splits`、`stats`、`validation`。只导出数值特征；相机流和其它非数值列会记录在 `dropped_features`。
 
 ---
 
@@ -322,6 +325,63 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 
 ---
 
+## 18. `inspect_media`
+
+列出 image/video/depth/point_cloud/language 模态与任务指令。`probe=true` 时只在 ffprobe 可用处探测视频；缺失 ffprobe 返回 `video_probe.available=false` 和安装提示。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | ✓ | 数据集路径 |
+| `max_videos` | int | | 最多探测的视频数，默认 4 |
+| `probe` | boolean | | 默认 true；false 只做模态清单 |
+
+---
+
+## 19. `decode_samples`
+
+为 rosbag2/MCAP 解码少量 CDR topic 样本，或读取 RLDS episode 样本。`include_arrays=true` 时返回深度图/点云数组，建议只用于小样本。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | ✓ | 数据集路径 |
+| `topic` | string | | rosbag2/MCAP topic；RLDS 不需要 |
+| `episode` | int | | 限制 episode |
+| `limit` | int | | 样本数，默认 5 |
+| `include_arrays` | boolean | | 返回原始数组，默认 false |
+
+支持类型包括 JointState、Imu、Odometry、Pose、Twist、Vector3、Image、CompressedImage、PointCloud2、LaserScan、String、Float/Int 数组和常用标量。
+
+---
+
+## 20. `apply_annotations`
+
+把 reviewer 标签与 `labeling_tasks` manifest 对账。重复 task 的标签 last-wins；冲突、未知 task、覆盖率和异常 episode 都会返回。`out` 存在时原子写入。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `manifest` | object | ✓ | labeling_tasks 输出，或 manifest 路径 |
+| `labels` | object[] | | `{task_id, answer, reason?, reviewer?}`；也接受 legacy `{id, answer}` |
+| `previous` | string | | 可选的旧标签 JSON/JSONL，用于幂等合并 |
+| `out` | string | | 原子写入 reviewed JSON/JSONL |
+
+`answer` 规范化为 `valid / invalid / needs_fix / unknown`，并返回 `counts`、`conflicts`、`flagged_episodes`。
+
+---
+
+## 21. `storage_pull`
+
+把 file/http(s)/s3 对象或前缀原子拉取到本地，带重试、SHA-256 和 `.embodied-source.json` 来源清单。S3 需要 `embodied-core[s3]`。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `uri` | string | ✓ | file/http(s)/s3 URI |
+| `destination` | string | ✓ | 本地目标 |
+| `overwrite` | boolean | | 默认 false |
+| `retries` | int | | 默认 2 |
+| `timeout_s` | number | | 默认 30 |
+
+---
+
 ## 错误码
 
 | code | 含义 | 怎么办 |
@@ -329,5 +389,9 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 | `unsupported_format` | 路径存在但认不出 | 先用 `list_formats` 看支持范围；新格式写 adapter |
 | `frames_unavailable` | 能识别但读不到帧 | 按返回的 `install` 装可选依赖 |
 | `frame_limit_exceeded` | 本次物化超过 `max_frames` | 减小 `chunk_frames`、改用 `iter_frames`，或显式提高上限 |
+| `unsupported_message_type` | CDR schema 不在内置类型表 | 用 `list_formats.platform.ros2_cdr` 查看支持范围，或先转换 |
+| `decoder_error` | CDR 载荷损坏/截断/超限 | 检查录制文件和 `EMBODIED_MAX_MESSAGE_BYTES` |
+| `storage_unavailable` | 缺 boto3 等存储依赖 | 按 `install` 安装对应 extra |
+| `storage_error` | 下载/校验/路径安全失败 | 检查 URI、网络和 `EMBODIED_MAX_DOWNLOAD_BYTES` |
 | `not_found` | 路径不存在 | 检查路径 |
 | `bad_arguments` | 参数类型/取值不对 | 按提示修正 |

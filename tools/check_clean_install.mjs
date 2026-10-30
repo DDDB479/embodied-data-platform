@@ -125,7 +125,7 @@ try {
   const probe = run(process.execPath, probeArgs, installedRoot);
   if (probe.status !== 0) fail('installed package probe failed', `${probe.stdout}\n${probe.stderr}`);
   const report = JSON.parse(probe.stdout);
-  if (!report.ok || report.toolCount < 20) fail(`installed probe returned an unhealthy report: ${probe.stdout}`);
+  if (!report.ok || report.toolCount < 24) fail(`installed probe returned an unhealthy report: ${probe.stdout}`);
 
   console.log('clean-install: ok');
   console.log(`  packager     ${packager}`);

@@ -16,6 +16,8 @@ Typical use::
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -539,7 +541,23 @@ def build_labeling_tasks(
                         "suggested_label": f"describe the {segment['label']} phase",
                     }
                 )
+    manifest_source = {
+        "path": summary.path,
+        "format": summary.format,
+        "episodes": summary.episode_count,
+        "task_bounds": [
+            [task["kind"], task["episode"], task["start_frame"], task["end_frame"]] for task in tasks
+        ],
+    }
+    manifest_id = "lm_" + hashlib.sha256(
+        json.dumps(manifest_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+    for position, task in enumerate(tasks):
+        task["task_id"] = "task_" + hashlib.sha256(f"{manifest_id}:{position}".encode("utf-8")).hexdigest()[:12]
+        task["status"] = "pending"
     return {
+        "schema_version": 1,
+        "manifest_id": manifest_id,
         "dataset": {
             "path": summary.path,
             "format": summary.format,
@@ -551,7 +569,8 @@ def build_labeling_tasks(
         "tasks": tasks,
         "instructions": (
             "For each task, inspect the given frame range and answer the question. "
-            "Return JSON lines: {\"id\": <task index>, \"answer\": ...}."
+            "Return JSON lines: {\"task_id\": <task_id>, \"answer\": valid|invalid|needs_fix, \"reason\": ...}. "
+            "Legacy {\"id\": <task index>, \"answer\": ...} is also accepted."
         ),
     }
 

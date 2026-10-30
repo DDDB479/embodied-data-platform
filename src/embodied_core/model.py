@@ -165,6 +165,12 @@ class DatasetSummary:
     def feature_keys(self) -> list[str]:
         return [f.key for f in self.features]
 
+    def modality_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for feature in self.features:
+            counts[feature.kind] = counts.get(feature.kind, 0) + 1
+        return counts
+
     def to_dict(self, *, include_episodes: bool = True) -> dict[str, Any]:
         body: dict[str, Any] = {
             "path": self.path,
@@ -178,6 +184,7 @@ class DatasetSummary:
             "split": self.split,
             "tasks": _clean(self.tasks),
             "features": [f.to_dict() for f in self.features],
+            "modalities": self.modality_counts(),
             "notes": _clean(self.notes),
             "sources": self.sources,
         }

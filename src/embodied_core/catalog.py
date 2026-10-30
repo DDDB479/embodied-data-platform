@@ -478,6 +478,7 @@ def search(
     min_duration: float | None = None,
     min_score: int | None = None,
     limit: int = 50,
+    offset: int = 0,
     order_by: str = "indexed_at",
     descending: bool = True,
 ) -> list[dict[str, Any]]:
@@ -524,14 +525,34 @@ def search(
     )
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    sql += f" ORDER BY {column} {direction} LIMIT ?"
-    params.append(int(limit))
+    sql += f" ORDER BY {column} {direction} LIMIT ? OFFSET ?"
+    params.extend([max(1, int(limit)), max(0, int(offset))])
     conn = connect(db_path)
     try:
         rows = [_decode_row(dict(row)) for row in conn.execute(sql, params)]
     finally:
         conn.close()
     return rows
+
+
+def get_dataset(db_path: str | Path, dataset_id: int) -> dict[str, Any] | None:
+    """Return one current dataset/version row by logical dataset id."""
+
+    if not Path(db_path).expanduser().exists():
+        raise FileNotFoundError(db_path)
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT d.id AS dataset_id, d.path, d.created_at AS dataset_created_at, d.updated_at, "
+            "v.id AS version_id, v.fingerprint, v.format, v.format_version AS version, v.episodes, v.frames, "
+            "v.duration_s, v.fps, v.robot_type, v.tasks, v.features, v.notes, v.meta, v.score, v.marker, "
+            "v.mtime, v.size, v.indexed_at FROM datasets d JOIN dataset_versions v ON v.id=d.current_version_id "
+            "WHERE d.id=?",
+            (int(dataset_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    return _decode_row(dict(row)) if row is not None else None
 
 
 def versions(db_path: str | Path, *, path: str | Path | None = None, limit: int = 50) -> list[dict[str, Any]]:
