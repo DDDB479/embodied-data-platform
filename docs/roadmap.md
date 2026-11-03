@@ -1,4 +1,4 @@
-# v0.4 / v0.5 平台化范围
+# v0.4–v0.6 平台化范围
 
 ## v0.4（功能平台化）
 
@@ -21,6 +21,17 @@
 - 标注回写支持 previous 合并、重复标签 last-wins 和冲突记录，可重复执行。
 - HTTP API 提供 Bearer / X-API-Key、分页、强 ETag；只读，不在 HTTP 路径写 catalog。
 - 代码和文档均要求“有依赖走真解码、无依赖结构化降级”，不得静默返回错误数值。
+
+## v0.6（生产操作层）
+
+| 模块 | 交付内容 |
+| --- | --- |
+| DAG 流水线 | 持久化 spec/run/node output；tool/processor/human/noop 节点；依赖校验、模板变量、重试、人工等待与恢复 |
+| 人工任务 | 稳定 task_id、预标/置信度、uncertainty/stratified 抽样、分配、完成、SLA 与标签导出 |
+| 处理器协议 | `register_processor` / `load_processor`；内置 dataset inventory、ffprobe video probe、frame plan |
+| 交付包 | `delivery-manifest.json`、逐文件 SHA-256、质量门证据、JSONL/LeRobot/Zarr/MCAP inventory |
+| 训练格式 | Zarr v2 数值导出（chunk/metadata 可独立读取） |
+| 可观测性 | pipeline 状态/失败节点/平均耗时；task 覆盖率与逾期；delivery check |
 
 ## 稳定性约定
 

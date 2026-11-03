@@ -26,6 +26,7 @@ import sys
 import threading
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
@@ -35,18 +36,22 @@ from .catalog import history as catalog_history
 from .catalog import search as catalog_search
 from .catalog import stats as catalog_stats
 from .convert import ConversionError, convert
+from .delivery import DeliveryError, build_delivery, check_delivery
 from .formats.base import FrameLimitExceeded, FramesUnavailable
 from .gate import evaluate_quality_gate
 from .jobs import Job, JobCancelled, JobManager, JobNotFound
 from .media import probe_dataset_media
+from .pipeline import PipelineError, PipelineNotFound, PipelineStore, resume_pipeline, run_pipeline
 from .platform import capability_report
 from .model import to_jsonable
 from .quality import build_labeling_tasks, compute_dataset_stats, detect_anomalies, make_windows, segment_by_motion
 from .registry import UnsupportedFormat, describe_formats, detect_dataset, open_dataset
 from .reports import quality_report
 from .ros2_codec import CDRError, UnsupportedMessageType
+from .processors import ProcessorError
 from .scaffold import scaffold
 from .storage import StorageError, StorageUnavailable, pull as storage_pull
+from .task_queue import TaskQueueError, TaskQueueStore
 from .validate import CHECKS, DEFAULT_CHECKS, validate
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -71,6 +76,11 @@ _ERROR_CODES: tuple[tuple[type[BaseException], str], ...] = (
     (CDRError, "decoder_error"),
     (StorageUnavailable, "storage_unavailable"),
     (StorageError, "storage_error"),
+    (PipelineNotFound, "pipeline_not_found"),
+    (PipelineError, "pipeline_error"),
+    (DeliveryError, "delivery_error"),
+    (TaskQueueError, "task_queue_error"),
+    (ProcessorError, "processor_error"),
     (KeyError, "bad_arguments"),
     (ValueError, "bad_arguments"),
 )
@@ -462,6 +472,93 @@ def tool_storage_pull(arguments: dict[str, Any]) -> Any:
     )
 
 
+def tool_pipeline_run(arguments: dict[str, Any]) -> Any:
+    store = arguments.get("store")
+    if not isinstance(store, str) or not store:
+        raise ValueError("store is required for pipeline_run")
+    if arguments.get("run_id"):
+        results = arguments.get("human_results") or {}
+        return resume_pipeline(str(arguments["run_id"]), store=store, human_results=results)
+    spec = arguments.get("spec")
+    if not isinstance(spec, (dict, str)):
+        raise ValueError("spec must be a pipeline object or path")
+    return run_pipeline(
+        spec,
+        store=store,
+        variables=arguments.get("variables") or {},
+        allow_write=bool(arguments.get("allow_write", False)),
+    )
+
+
+def tool_pipeline_status(arguments: dict[str, Any]) -> Any:
+    store = arguments.get("store")
+    if not isinstance(store, str) or not store:
+        raise ValueError("store is required for pipeline_status")
+    manager = PipelineStore(store)
+    if arguments.get("stats"):
+        return manager.stats()
+    if arguments.get("run_id"):
+        return manager.get_run(str(arguments["run_id"]))
+    return {"runs": manager.list_runs(limit=int(arguments.get("limit", 20)), status=arguments.get("status"))}
+
+
+def tool_task_queue(arguments: dict[str, Any]) -> Any:
+    store = arguments.get("store")
+    if not isinstance(store, str) or not store:
+        raise ValueError("store is required")
+    manager = TaskQueueStore(store)
+    action = arguments.get("action")
+    if action == "ingest":
+        if arguments.get("manifest") is None:
+            raise ValueError("manifest is required for ingest")
+        return manager.ingest(
+            arguments["manifest"],
+            prelabels=arguments.get("prelabels"),
+            strategy=arguments.get("strategy", "priority"),
+            limit=arguments.get("limit"),
+        )
+    if action == "list":
+        return {"tasks": manager.list(status=arguments.get("status"), assignee=arguments.get("assignee"), limit=int(arguments.get("limit", 100)), offset=int(arguments.get("offset", 0)))}
+    if action == "assign":
+        assignee = arguments.get("assignee")
+        if not isinstance(assignee, str) or not assignee:
+            raise ValueError("assignee is required for assign")
+        return manager.assign(assignee, limit=int(arguments.get("limit", 20)), strategy=arguments.get("strategy", "priority"))
+    if action == "complete":
+        return manager.complete(arguments.get("labels") or [], reviewer=arguments.get("reviewer"))
+    if action == "stats":
+        return manager.stats()
+    if action == "export":
+        labels = manager.export_labels()
+        if arguments.get("out"):
+            out = Path(arguments["out"]).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            temp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
+            temp.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in labels), encoding="utf-8")
+            os.replace(temp, out)
+            return {"written_to": str(out.resolve()), "labels": len(labels)}
+        return {"labels": labels}
+    raise ValueError("action must be one of ingest, list, assign, complete, stats, export")
+
+
+def tool_delivery(arguments: dict[str, Any]) -> Any:
+    action = arguments.get("action")
+    if action == "build":
+        return build_delivery(
+            arguments["source"],
+            arguments["destination"],
+            formats=arguments.get("formats") or ["lerobot-v3"],
+            name=arguments.get("name"),
+            version=str(arguments.get("version", "1")),
+            overwrite=bool(arguments.get("overwrite", False)),
+            quality_rules=arguments.get("rules"),
+            license=arguments.get("license"),
+        )
+    if action == "check":
+        return check_delivery(arguments["destination"], verify_hashes=bool(arguments.get("verify_hashes", True)))
+    raise ValueError("action must be build or check")
+
+
 def tool_formats(arguments: dict[str, Any]) -> Any:
     return {
         "formats": describe_formats(),
@@ -749,6 +846,83 @@ TOOLS: list[dict[str, Any]] = [
         "handler": tool_storage_pull,
     },
     {
+        "name": "pipeline_run",
+        "description": "Run or resume a persistent DAG pipeline. Nodes can be tool, processor or human; human nodes pause with status=waiting_human and resume via run_id + human_results. Write tools require allow_write=true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec": {"type": ["object", "string"], "description": "Pipeline object or JSON/TOML path"},
+                "store": {"type": "string"},
+                "variables": {"type": "object", "default": {}},
+                "allow_write": {"type": "boolean", "default": False},
+                "run_id": {"type": "string", "description": "Resume this run instead of creating one"},
+                "human_results": {"type": "object", "description": "Map human node id to reviewed result"},
+            },
+            "required": ["store"],
+        },
+        "handler": tool_pipeline_run,
+    },
+    {
+        "name": "pipeline_status",
+        "description": "Read one pipeline run, list recent runs, or return aggregate status/failure statistics.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "store": {"type": "string"},
+                "run_id": {"type": "string"},
+                "status": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+                "stats": {"type": "boolean", "default": False},
+            },
+            "required": ["store"],
+        },
+        "handler": tool_pipeline_status,
+    },
+    {
+        "name": "task_queue",
+        "description": "Persistent human-review queue: ingest manifests with prelabels/sampling, list/assign/complete tasks, export labels and inspect coverage/overdue stats.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["ingest", "list", "assign", "complete", "stats", "export"]},
+                "store": {"type": "string"},
+                "manifest": {"type": ["object", "string"]},
+                "prelabels": {"type": "array", "items": {"type": "object"}},
+                "strategy": {"type": "string", "enum": ["priority", "uncertainty", "stratified", "first", "sequential"]},
+                "limit": {"type": "integer"},
+                "status": {"type": "string"},
+                "assignee": {"type": "string"},
+                "labels": {"type": "array", "items": {"type": "object"}},
+                "reviewer": {"type": "string"},
+                "out": {"type": "string"},
+                "offset": {"type": "integer", "default": 0},
+            },
+            "required": ["action", "store"],
+        },
+        "handler": tool_task_queue,
+    },
+    {
+        "name": "delivery",
+        "description": "Build a versioned delivery pack (jsonl/lerobot-v2/lerobot-v3/zarr/mcap-inventory) with manifest and hashes, or verify an existing pack.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["build", "check"]},
+                "source": {"type": "string"},
+                "destination": {"type": "string"},
+                "formats": {"type": "array", "items": {"type": "string"}},
+                "name": {"type": "string"},
+                "version": {"type": "string", "default": "1"},
+                "overwrite": {"type": "boolean", "default": False},
+                "rules": {"type": ["object", "string"]},
+                "license": {"type": "string"},
+                "verify_hashes": {"type": "boolean", "default": True},
+            },
+            "required": ["action", "destination"],
+        },
+        "handler": tool_delivery,
+    },
+    {
         "name": "list_formats",
         "description": "List supported dataset formats, how each is detected, which optional dependency it needs, and the available validation checks.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -836,6 +1010,9 @@ _WRITE_TOOLS = {
     "catalog_index",
     "apply_annotations",
     "storage_pull",
+    "pipeline_run",
+    "task_queue",
+    "delivery",
 }
 
 
@@ -845,7 +1022,7 @@ def _annotations(tool: dict[str, Any]) -> dict[str, bool]:
     return {
         "readOnlyHint": read_only,
         "destructiveHint": name in {"labeling_tasks", "convert_dataset", "scaffold_project", "apply_annotations"},
-        "openWorldHint": name == "storage_pull",
+        "openWorldHint": name in {"storage_pull", "pipeline_run"},
     }
 
 
@@ -885,6 +1062,10 @@ def call_tool(
         UnsupportedMessageType,
         CDRError,
         StorageError,
+        PipelineError,
+        DeliveryError,
+        TaskQueueError,
+        ProcessorError,
         ValueError,
         KeyError,
     ) as exc:
@@ -932,7 +1113,9 @@ def handle_message(
                 "runs and lineage; inspect them with catalog_history. rosbag2/MCAP CDR and RLDS TFRecord samples "
                 "are available through decode_samples; inspect_media inventories depth/point-cloud/language/video "
                 "modalities. apply_annotations reconciles reviewer labels, and storage_pull materializes object-store "
-                "datasets atomically. Convert with target=lerobot-v3 for stats and train/val/test splits."
+                "datasets atomically. v0.6 adds persistent pipeline_run/pipeline_status DAGs, a human task_queue with "
+                "prelabels and sampling, and delivery packs with manifests/checksums. Convert with target=lerobot-v3 "
+                "for stats and train/val/test splits."
             ),
         }
     elif method in ("notifications/initialized", "initialized"):

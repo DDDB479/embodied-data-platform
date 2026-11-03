@@ -183,14 +183,14 @@ def write_rosbag2(root: Path, messages: int = 40) -> Path:
 def write_mcap(root: Path, messages: int = 20) -> Path | None:
     """MCAP file; returns None when the mcap library is unavailable."""
     try:
-        from mcap.writer import Writer
+        from mcap.writer import CompressionType, Writer
     except ImportError:
         return None
     root = root / "mcap"
     root.mkdir(parents=True, exist_ok=True)
     path = root / "episode.mcap"
     with path.open("wb") as handle:
-        writer = Writer(handle)
+        writer = Writer(handle, compression=CompressionType.NONE)
         writer.start()
         schema_id = writer.register_schema(name="std_msgs/Float64", encoding="ros1msg", data=b"float64 data")
         channel_id = writer.register_channel(topic="/cmd_vel", message_encoding="ros1", schema_id=schema_id)
@@ -386,14 +386,14 @@ def write_mcap_cdr(root: Path, messages: int = 10) -> Path | None:
     """MCAP with a CDR JointState channel; returns None without mcap."""
 
     try:
-        from mcap.writer import Writer
+        from mcap.writer import CompressionType, Writer
     except ImportError:
         return None
     root = root / "mcap_cdr"
     root.mkdir(parents=True, exist_ok=True)
     path = root / "episode.mcap"
     with path.open("wb") as handle:
-        writer = Writer(handle)
+        writer = Writer(handle, compression=CompressionType.NONE)
         writer.start()
         schema_id = writer.register_schema(
             name="sensor_msgs/msg/JointState",

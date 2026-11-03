@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased (0.5.0)
+## 0.6.0 - 2026-11-02
+
+### Data-production workflow layer
+
+- Added a persistent DAG pipeline runner with typed tool/processor/human/noop nodes, dependency validation, template variables, retries, node-level outputs and resumable `waiting_human` states.
+- Added `pipeline_run` / `pipeline_status` MCP tools and `embodied pipeline run|status|list|resume|stats` CLI commands.
+- Added a persistent human task queue with stable task IDs, prelabels, confidence/priority, uncertainty and stratified sampling, assignment, review completion, overdue tracking and label export.
+- Added the `task_queue` MCP tool and `embodied tasks ingest|list|assign|complete|stats|export` CLI commands.
+- Added a processor plugin protocol (`register_processor`, `load_processor`) with built-in dataset inventory, ffprobe video probe and frame-plan processors.
+- Added versioned delivery packs with per-file SHA-256 manifests, optional quality-gate evidence, `jsonl`/LeRobot v2/v3/Zarr/MCAP-inventory artifacts, and `embodied deliver build|check` plus the `delivery` MCP tool.
+- Added dependency-free Zarr v2 numeric export with chunk metadata.
+- Added `embodied doctor` pipeline/task/delivery/processor capability reporting.
+
+## 0.5.0 - 2026-10-30
 
 ### Stability and operations
 

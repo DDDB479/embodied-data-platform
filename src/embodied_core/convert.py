@@ -431,6 +431,90 @@ def to_lerobot_v3(
     }
 
 
+def _zarr_array_name(key: str) -> str:
+    return key.replace("\\", "_").replace("/", "__").replace(".", "_").replace(":", "_")
+
+
+def to_zarr(
+    dataset,
+    destination: Path,
+    *,
+    episodes: Sequence[int] | None = None,
+    overwrite: bool = False,
+    chunk_rows: int = 1024,
+) -> dict[str, Any]:
+    """Write numeric columns as dependency-free Zarr v2 arrays."""
+
+    ids, columns, episode_ids = _episode_columns(dataset, episodes)
+    if not columns:
+        raise ConversionError("nothing numeric to write")
+    destination = destination.expanduser()
+    if destination.exists() and not overwrite:
+        raise ConversionError(f"{destination} exists; pass overwrite=True")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.zarr-", dir=str(destination.parent)))
+    chunk_rows = max(1, int(chunk_rows))
+    try:
+        (staging / ".zgroup").write_text('{"zarr_format":2}\n', encoding="utf-8")
+        arrays_root = staging / "arrays"
+        arrays_root.mkdir(parents=True, exist_ok=True)
+        feature_meta: dict[str, Any] = {}
+        total_values = 0
+        for key, values in columns.items():
+            array = np.asarray(values, dtype=np.float32)
+            if array.ndim == 1:
+                array = array.reshape(-1, 1)
+            elif array.ndim > 2:
+                array = array.reshape(array.shape[0], -1)
+            name = _zarr_array_name(key)
+            folder = arrays_root / name
+            folder.mkdir(parents=True, exist_ok=True)
+            rows, dims = int(array.shape[0]), int(array.shape[1])
+            for chunk_index, start in enumerate(range(0, rows, chunk_rows)):
+                chunk = np.ascontiguousarray(array[start : start + chunk_rows, :], dtype="<f4")
+                (folder / f"{chunk_index}.0").write_bytes(chunk.tobytes(order="C"))
+            metadata = {
+                "zarr_format": 2,
+                "shape": [rows, dims],
+                "chunks": [min(chunk_rows, max(rows, 1)), dims],
+                "dtype": "<f4",
+                "compressor": None,
+                "fill_value": None,
+                "order": "C",
+                "filters": None,
+            }
+            (folder / ".zarray").write_text(json.dumps(metadata, separators=(",", ":")), encoding="utf-8")
+            feature_meta[key] = {"path": f"arrays/{name}", **metadata}
+            total_values += rows * dims
+        info = {
+            "format": "zarr-v2",
+            "dataset": to_jsonable(dataset.summary.to_dict(include_episodes=False)),
+            "frames": len(ids),
+            "episodes": episode_ids,
+            "chunk_rows": chunk_rows,
+            "features": feature_meta,
+        }
+        (staging / "meta.json").write_text(json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if destination.exists():
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
+        os.replace(staging, destination)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return {
+        "target": "zarr-v2",
+        "destination": str(destination.resolve()),
+        "episodes": len(episode_ids),
+        "frames": len(ids),
+        "values": total_values,
+        "features": list(feature_meta),
+        "dropped_features": [feature.key for feature in dataset.summary.features if feature.key not in columns],
+    }
+
+
 def convert(
     source: str | Path,
     destination: str | Path,

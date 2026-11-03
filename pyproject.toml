@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "embodied-core"
-version = "0.5.0"
-description = "Format-aware platform toolkit for embodied-AI datasets: CDR/RLDS decoding, media inventory, QC, versioned catalog, training export and object storage."
+version = "0.6.0"
+description = "Embodied-AI data production platform: DAG pipelines, human review queues, processors, delivery packs, CDR/RLDS decoding, QC, catalog and training export."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -18,6 +18,9 @@ Available tools (MCP server "embodied-data-studio" / DSH plugin "embodied-data")
   catalog_index|search|stats|history
   apply_annotations   reconcile reviewer labels with stable task IDs
   storage_pull        atomic file/http(s)/s3 materialization
+  pipeline_run|status persistent DAG with resumable human nodes
+  task_queue          prelabels, sampling, assignment and review completion
+  delivery            checksummed versioned delivery packs
   plan_windows        fixed-length training windows
   list_formats        what is supported at all
   submit_job          background quality_report / validate_dataset / quality_gate
@@ -67,3 +70,9 @@ Working rules:
     labels are last-wins with conflicts reported. Never rewrite manifests by hand.
 14. Object-store pulls are checksummed and source-manifested. Do not claim a
     remote dataset is locally verified until `storage_pull` succeeds.
+15. Use `pipeline_run` when work has more than two dependent stages. Give every
+    node a stable id and `depends_on`; never emulate a DAG with repeated manual calls.
+16. A human pipeline node pauses as `waiting_human`. Review its manifest through
+    `task_queue`, then resume the same run with `run_id` and `human_results`.
+17. Delivery is not complete until `delivery.check` verifies the manifest and
+    all hashes. Do not hand-wave a delivery by listing output files.

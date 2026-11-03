@@ -40,6 +40,7 @@ def t_import():
     import embodied_core.cache  # noqa: F401
     import embodied_core.cli  # noqa: F401
     import embodied_core.convert  # noqa: F401
+    import embodied_core.delivery  # noqa: F401
     import embodied_core.formats.hdf5  # noqa: F401
     import embodied_core.formats.jsonl  # noqa: F401
     import embodied_core.formats.lerobot  # noqa: F401
@@ -51,12 +52,15 @@ def t_import():
     import embodied_core.jobs  # noqa: F401
     import embodied_core.media  # noqa: F401
     import embodied_core.platform  # noqa: F401
+    import embodied_core.pipeline  # noqa: F401
+    import embodied_core.processors  # noqa: F401
     import embodied_core.quality  # noqa: F401
     import embodied_core.reports  # noqa: F401
     import embodied_core.ros2_codec  # noqa: F401
     import embodied_core.registry  # noqa: F401
     import embodied_core.scaffold  # noqa: F401
     import embodied_core.storage  # noqa: F401
+    import embodied_core.task_queue  # noqa: F401
     import embodied_core.tfrecord  # noqa: F401
     import embodied_core.validate  # noqa: F401
     return embodied_core.__version__

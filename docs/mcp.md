@@ -9,7 +9,7 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 
 每个工具返回**一个 JSON 文本块**。成功时是业务数据本身；失败时是 `{"error": {"code": "...", "message": "..."}}`，不会抛协议级异常——模型可以读到错误并自行纠正。
 
-`tools/list` 会为每个工具附带 MCP annotations：读工具 `readOnlyHint: true`，写工具 `readOnlyHint: false`。写工具包括 `labeling_tasks`（仅在传 `out` 时落盘）、`convert_dataset`、`scaffold_project`、`catalog_index`、`apply_annotations` 和 `storage_pull`；`storage_pull` 同时标记 `openWorldHint: true`。支持审批的宿主会据此提示；DSH 插件还会把写工具设为串行，并对工作区外目标申请一次性审批。
+`tools/list` 会为每个工具附带 MCP annotations：读工具 `readOnlyHint: true`，写工具 `readOnlyHint: false`。写工具包括 `labeling_tasks`、`convert_dataset`、`scaffold_project`、`catalog_index`、`apply_annotations`、`storage_pull`、`pipeline_run`、`task_queue` 和 `delivery`；`storage_pull` 与 `pipeline_run` 同时标记 `openWorldHint: true`。支持审批的宿主会据此提示；DSH 插件还会把写工具设为串行，并对工作区外目标申请一次性审批。
 
 ## 进度通知与异步作业
 
@@ -382,6 +382,71 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 
 ---
 
+## 22. `pipeline_run`
+
+运行或恢复持久化 DAG 流水线。节点类型：`tool` / `processor` / `human` / `noop`；支持 `depends_on`、`retries`、`continue_on_error`、模板变量和节点输出引用。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `spec` | object/string | | pipeline 对象或 JSON/TOML 路径；恢复时可省略 |
+| `store` | string | | pipeline SQLite，默认 `pipeline-runs.sqlite3` |
+| `variables` | object | | `${input}` 等模板变量 |
+| `allow_write` | boolean | | 写工具节点必须显式 true |
+| `run_id` | string | | 恢复已有 run |
+| `human_results` | object | | human node id → reviewed result |
+
+`human` 节点首次执行返回 `status=waiting_human`；reviewer 完成后用同一 `run_id` 恢复，不创建重复 run。
+
+---
+
+## 23. `pipeline_status`
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `store` | string | | pipeline SQLite |
+| `run_id` | string | | 单次 run 详情 |
+| `status` | string | | list 过滤 |
+| `limit` | int | | 默认 20 |
+| `stats` | boolean | | true 时返回吞吐/失败节点统计 |
+
+---
+
+## 24. `task_queue`
+
+人工任务队列，按 action 操作：`ingest/list/assign/complete/stats/export`。支持预标、uncertainty/stratified 抽样、分配、SLA 和标签导出。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `action` | string | ✓ | ingest/list/assign/complete/stats/export |
+| `store` | string | ✓ | 队列 SQLite |
+| `manifest` | object/string | | ingest 用 labeling manifest |
+| `prelabels` | object[] | | `{task_id,label,confidence,source}` |
+| `strategy` | string | | priority/uncertainty/stratified/first/sequential |
+| `assignee` | string | | assign 用 |
+| `labels` | object[] | | complete 用 |
+| `out` | string | | export 标签输出 |
+
+---
+
+## 25. `delivery`
+
+构建或校验版本化交付包：`jsonl`、`lerobot-v2`、`lerobot-v3`、`zarr`、`mcap-inventory`。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `action` | string | ✓ | build/check |
+| `destination` | string | ✓ | 交付目录 |
+| `source` | string | | build 源数据集 |
+| `formats` | string[] | | 默认 lerobot-v3 |
+| `name/version` | string | | 交付名称/版本 |
+| `rules` | object/string | | 可选质量门 |
+| `license` | string | | 许可证元数据 |
+| `verify_hashes` | boolean | | check 默认 true |
+
+交付目录的 `delivery-manifest.json` 记录源指纹、产物、逐文件大小/SHA-256、质量门摘要。
+
+---
+
 ## 错误码
 
 | code | 含义 | 怎么办 |
@@ -393,5 +458,9 @@ embodied-mcp --list-tools    # 本地打印工具清单，排查配置问题用
 | `decoder_error` | CDR 载荷损坏/截断/超限 | 检查录制文件和 `EMBODIED_MAX_MESSAGE_BYTES` |
 | `storage_unavailable` | 缺 boto3 等存储依赖 | 按 `install` 安装对应 extra |
 | `storage_error` | 下载/校验/路径安全失败 | 检查 URI、网络和 `EMBODIED_MAX_DOWNLOAD_BYTES` |
+| `pipeline_not_found` | pipeline run 不存在 | 用 `pipeline_status` 列出最近 run |
+| `pipeline_error` | DAG 定义、节点或写策略失败 | 检查依赖、模板路径和 `allow_write` |
+| `task_queue_error` | 人工队列操作失败 | 检查 store/manifest/action 参数 |
+| `delivery_error` | 交付格式或构建失败 | 检查支持的 formats、目标和源数据 |
 | `not_found` | 路径不存在 | 检查路径 |
 | `bad_arguments` | 参数类型/取值不对 | 按提示修正 |

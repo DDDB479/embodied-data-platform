@@ -2,8 +2,8 @@
 
 `dsh-embodied-data` 是具身智能数据平台的 DSH/MCP 插件。插件本身是轻量 JS 桥接，真正能力来自统一的 `embodied_core` Python 核心，因此 DSH、Codex、Claude Code 和其他 MCP 客户端使用同一套行为。
 
-- 当前版本：`0.5.0`
-- 工具规模：23 个 MCP 工具 + 1 个插件自检工具，共 24 个 `embodied_*` 工具
+- 当前版本：`0.6.0`
+- 工具规模：27 个 MCP 工具 + 1 个插件自检工具，共 28 个 `embodied_*` 工具
 - 支持格式：LeRobot v2/v3、HDF5/robomimic、rosbag1/2、MCAP、RLDS/TFRecord、canonical JSONL
 
 ## 能力矩阵
@@ -25,6 +25,10 @@
 | 对象存储 | file/http(s)/s3 原子拉取、重试、SHA-256、来源 manifest |
 | 异步任务 | `job_id`、进度通知、协作式取消、只读任务隔离 |
 | 平台诊断 | `embodied doctor`、依赖/解码器/资源上限/能力矩阵 |
+| 生产流水线 | 持久化 DAG、tool/processor/human/noop 节点、重试、人工等待与恢复、节点统计 |
+| 人工运营 | 任务队列、预标/置信度、uncertainty/stratified 抽样、分配、SLA、标签导出 |
+| 处理器插件 | 注册/动态加载处理器，内置 dataset inventory、video probe、frame plan |
+| 标准交付 | 交付 manifest、逐文件 SHA-256、质量门证据、JSONL/LeRobot/Zarr/MCAP inventory |
 
 ## 工具清单
 
@@ -63,6 +67,13 @@
 - `submit_job`、`job_status`、`cancel_job`、`list_jobs`：后台只读分析与进度。
 - `self_check`：解释器、import 路径和 MCP 进程状态。
 
+### v0.6 生产编排
+
+- `pipeline_run`：运行/恢复持久化 DAG，写工具节点需要显式 `allow_write`。
+- `pipeline_status`：单次运行、最近运行列表或失败/吞吐统计。
+- `task_queue`：任务 ingest/list/assign/complete/stats/export。
+- `delivery`：构建或校验交付包。
+
 ## 典型工作流
 
 ```text
@@ -83,6 +94,10 @@
 
 大数据
   submit_job -> job_status(progress) -> result -> catalog/history
+
+生产流水线
+  pipeline_run(spec) -> waiting_human -> task_queue -> pipeline_run(run_id,human_results)
+  -> convert/delivery -> catalog_index
 ```
 
 ## 安全与稳定性
@@ -94,6 +109,7 @@
 - 标注回写支持 previous 合并和幂等 last-wins。
 - CDR、TFRecord、点云、下载大小均有环境变量上限。
 - 可选依赖缺失时返回结构化安装提示，不静默产生错误结果。
+- Pipeline run、node output、人工任务和交付 manifest 都持久化，可恢复、可审计。
 
 ## 可选依赖与边界
 
@@ -114,9 +130,9 @@
 
 ## 验证状态
 
-- Python 单元测试：169
-- DSH 插件测试：16
-- 端到端检查：21
-- MCP 工具：23；DSH 工具：24
-- 干净安装：`dsh-embodied-data-0.5.0.tgz`
+- Python 单元测试：181
+- DSH 插件测试：17
+- 端到端检查：22
+- MCP 工具：27；DSH 工具：28
+- 干净安装：`dsh-embodied-data-0.6.0.tgz`
 - ffprobe 实测：2 秒 320×240 / 30fps H.264 + AAC，正确返回 60 帧、时长 2.0s、码率与音视频流信息

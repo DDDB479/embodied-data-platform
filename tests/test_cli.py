@@ -42,7 +42,7 @@ class CliTestCase(unittest.TestCase):
         code, output = _run("doctor", "--json")
         self.assertEqual(code, 0)
         payload = json.loads(output)
-        self.assertEqual(payload["version"], "0.5.0")
+        self.assertEqual(payload["version"], "0.6.0")
         self.assertIn("sensor_msgs/JointState", payload["ros2_cdr"]["message_types"])
 
     def test_detect_json(self) -> None:
@@ -202,6 +202,68 @@ class CliTestCase(unittest.TestCase):
         code, output = _run("storage", "pull", str(self.dataset), str(destination), "--json")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output)["files"], 2)
+
+    def test_pipeline_tasks_delivery_and_processors_commands(self) -> None:
+        spec = self.root / "pipeline.json"
+        spec.write_text(json.dumps({"name": "noop", "nodes": [{"id": "n", "type": "noop"}]}), encoding="utf-8")
+        pipeline_store = self.root / "runs.sqlite3"
+        code, output = _run("pipeline", "run", str(spec), "--store", str(pipeline_store), "--json")
+        self.assertEqual(code, 0)
+        run = json.loads(output)
+        self.assertEqual(run["status"], "succeeded")
+        code, output = _run("pipeline", "status", "--run", run["run_id"], "--store", str(pipeline_store), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["run_id"], run["run_id"])
+        code, output = _run("pipeline", "stats", "--store", str(pipeline_store), "--json")
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(json.loads(output)["total_runs"], 1)
+
+        manifest = self.root / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "manifest_id": "lm_cli",
+                    "dataset": {"path": str(self.dataset)},
+                    "tasks": [{"task_id": "t1", "episode": 0, "start_frame": 0, "end_frame": 2, "question": "ok?"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        task_store = self.root / "tasks.sqlite3"
+        code, output = _run("tasks", "ingest", "--manifest", str(manifest), "--store", str(task_store), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["inserted"], 1)
+        code, output = _run("tasks", "assign", "--store", str(task_store), "--assignee", "bob", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["assigned"], 1)
+        labels = self.root / "labels.jsonl"
+        labels.write_text(json.dumps({"task_id": "t1", "answer": "valid"}) + "\n", encoding="utf-8")
+        code, output = _run("tasks", "complete", "--store", str(task_store), "--labels", str(labels), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["updated"], 1)
+
+        delivery = self.root / "delivery"
+        code, output = _run(
+            "deliver",
+            "build",
+            str(self.dataset),
+            str(delivery),
+            "--format",
+            "jsonl",
+            "--format",
+            "zarr",
+            "--json",
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(output)["manifest"].endswith("delivery-manifest.json"))
+        code, output = _run("deliver", "check", str(delivery), "--json")
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(output)["ok"])
+
+        code, output = _run("processors", "--json")
+        self.assertEqual(code, 0)
+        names = {item["name"] for item in json.loads(output)["processors"]}
+        self.assertIn("dataset_inventory", names)
 
     def test_scaffold_command(self) -> None:
         code, _ = _run("scaffold", str(self.root / "proj"), "--kind", "pipeline", "--name", "daily")

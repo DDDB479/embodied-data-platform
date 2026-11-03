@@ -321,6 +321,55 @@ def t_lerobot_v3_and_platform():
     return "v3 stats/splits + media + annotations + storage + HTTP API"
 
 
+def t_v06_orchestration():
+    from embodied_core.delivery import build_delivery, check_delivery
+    from embodied_core.pipeline import run_pipeline
+    from embodied_core.processors import list_processors
+    from embodied_core.task_queue import TaskQueueStore
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run = run_pipeline(
+            {
+                "name": "e2e-dag",
+                "nodes": [
+                    {"id": "detect", "type": "tool", "tool": "detect_dataset", "arguments": {"path": "${input}"}},
+                    {"id": "summary", "type": "tool", "tool": "summarize_dataset", "arguments": {"path": "${input}"}, "depends_on": ["detect"]},
+                    {"id": "inventory", "type": "processor", "processor": "dataset_inventory", "arguments": {"path": "${input}"}, "depends_on": ["summary"]},
+                ],
+            },
+            store=root / "runs.sqlite3",
+            variables={"input": str(FIXTURES / "canonical")},
+        )
+        assert run["status"] == "succeeded", run
+        assert {"detect", "summary", "inventory"} <= {node["node_id"] for node in run["nodes"]}
+        assert list_processors(), "no processors registered"
+
+        manifest = support.write_jsonl_dataset(root / "spiky", spikes=True)
+        dataset = open_dataset(manifest)
+        try:
+            from embodied_core.quality import build_labeling_tasks, detect_anomalies
+
+            ids, columns = dataset.frames()
+            labeling = build_labeling_tasks(dataset.summary, detect_anomalies(ids, columns, fps=dataset.summary.fps), max_tasks=2)
+        finally:
+            dataset.close()
+        queue = TaskQueueStore(root / "tasks.sqlite3")
+        queued = queue.ingest(labeling, strategy="priority", limit=2)
+        assert queued["inserted"] == 2, queued
+        assigned = queue.assign("reviewer", limit=2)
+        assert assigned["assigned"] == 2, assigned
+        completed = queue.complete([{"task_id": assigned["tasks"][0], "answer": "valid"}])
+        assert completed["updated"] == 1, completed
+
+        delivery = root / "delivery"
+        built = build_delivery(FIXTURES / "canonical", delivery, formats=["jsonl", "zarr"], name="e2e", version="1")
+        assert built["formats"] == ["jsonl", "zarr"], built
+        checked = check_delivery(delivery)
+        assert checked["ok"], checked
+    return "persistent DAG + human queue + checksummed delivery"
+
+
 def t_convert_jsonl_roundtrip():
     from embodied_core.convert import convert
 
@@ -441,7 +490,7 @@ def t_mcp_stdio():
     responses = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     assert len(responses) == 4, [r.get("id") for r in responses]
     tools = responses[1]["result"]["tools"]
-    assert len(tools) == 23, len(tools)
+    assert len(tools) == 27, len(tools)
     detect_payload = json.loads(responses[2]["result"]["content"][0]["text"])
     assert detect_payload["format"] == "rosbag2", detect_payload
     summary_payload = json.loads(responses[3]["result"]["content"][0]["text"])
@@ -472,6 +521,7 @@ for label, fn in [
     ("streaming + gate", t_streaming_and_gate),
     ("CDR + RLDS decode", t_cdr_and_rlds_decoding),
     ("v0.5 platform", t_lerobot_v3_and_platform),
+    ("v0.6 orchestration", t_v06_orchestration),
     ("convert lerobot->jsonl", t_convert_jsonl_roundtrip),
     ("convert jsonl->lerobot", t_convert_lerobot),
     ("catalog", t_catalog),

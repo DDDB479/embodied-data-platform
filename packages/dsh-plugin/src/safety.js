@@ -34,6 +34,10 @@ export const PATH_ARGUMENTS = Object.freeze({
   decode_samples: ['path'],
   apply_annotations: ['manifest', 'previous', 'out'],
   storage_pull: ['destination'],
+  pipeline_run: ['spec', 'store'],
+  pipeline_status: ['store'],
+  task_queue: ['store', 'manifest', 'out'],
+  delivery: ['source', 'destination', 'rules'],
   plan_windows: ['path'],
 });
 
@@ -45,6 +49,9 @@ export const WRITE_TARGETS = Object.freeze({
   catalog_index: ['db'],
   apply_annotations: ['out'],
   storage_pull: ['destination'],
+  pipeline_run: ['store'],
+  task_queue: ['store', 'out'],
+  delivery: ['destination'],
 });
 
 export const WRITE_TOOLS = new Set(Object.keys(WRITE_TARGETS));

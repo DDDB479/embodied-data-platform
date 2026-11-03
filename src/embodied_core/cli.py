@@ -30,14 +30,18 @@ from .catalog import (
     versions as catalog_versions,
 )
 from .convert import ConversionError, convert
+from .delivery import DeliveryError, build_delivery, check_delivery
 from .gate import evaluate_quality_gate, load_quality_rules
 from .media import probe_dataset_media
 from .platform import capability_report
+from .pipeline import PipelineError, PipelineNotFound, PipelineStore, resume_pipeline, run_pipeline
+from .processors import ProcessorError, list_processors, load_processor
 from .model import summarize_issues, to_jsonable
 from .quality import build_labeling_tasks, compute_dataset_stats, detect_anomalies, make_windows, segment_by_motion
 from .registry import UnsupportedFormat, describe_formats, detect_dataset, open_dataset
 from .reports import quality_report
 from .storage import parse_storage_uri, pull as storage_pull
+from .task_queue import TaskQueueStore
 from .scaffold import scaffold
 from .validate import CHECKS, DEFAULT_CHECKS, run_checks, validate
 
@@ -239,6 +243,120 @@ def cmd_api(args: argparse.Namespace) -> int:
         pass
     finally:
         server.server_close()
+    return 0
+
+
+def _read_json_or_jsonl(path: str) -> Any:
+    target = Path(path).expanduser()
+    text = target.read_text(encoding="utf-8")
+    if target.suffix.lower() in (".jsonl", ".ndjson"):
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    return json.loads(text)
+
+
+def _parse_variables(values: Sequence[str]) -> dict[str, Any]:
+    variables: dict[str, Any] = {}
+    for item in values:
+        key, separator, raw = item.partition("=")
+        if not separator or not key:
+            raise ValueError(f"variable must look like key=value: {item!r}")
+        try:
+            variables[key] = json.loads(raw)
+        except json.JSONDecodeError:
+            variables[key] = raw
+    return variables
+
+
+def cmd_pipeline(args: argparse.Namespace) -> int:
+    try:
+        if args.pipeline_command == "run":
+            variables = _parse_variables(args.var or [])
+            if args.input:
+                variables.setdefault("input", args.input)
+            payload = run_pipeline(args.spec, store=args.store, variables=variables, allow_write=args.allow_write)
+        elif args.pipeline_command == "status":
+            payload = PipelineStore(args.store).get_run(args.run)
+        elif args.pipeline_command == "list":
+            payload = {"runs": PipelineStore(args.store).list_runs(limit=args.limit, status=args.status)}
+        elif args.pipeline_command == "stats":
+            payload = PipelineStore(args.store).stats()
+        elif args.pipeline_command == "resume":
+            results = {args.node: _read_json_or_jsonl(args.result)} if args.result else {}
+            payload = resume_pipeline(args.run, store=args.store, human_results=results)
+        else:
+            raise ValueError("missing pipeline subcommand")
+    except (OSError, ValueError, PipelineError, PipelineNotFound) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _emit(payload, True)
+    return 1 if payload.get("status") == "failed" else 0
+
+
+def cmd_tasks(args: argparse.Namespace) -> int:
+    store = TaskQueueStore(args.store)
+    try:
+        if args.tasks_command == "ingest":
+            prelabels = _read_json_or_jsonl(args.prelabels) if args.prelabels else None
+            payload = store.ingest(args.manifest, prelabels=prelabels, strategy=args.strategy, limit=args.limit)
+        elif args.tasks_command == "list":
+            payload = {"tasks": store.list(status=args.status, assignee=args.assignee, limit=args.limit)}
+        elif args.tasks_command == "assign":
+            payload = store.assign(args.assignee, limit=args.limit, strategy=args.strategy)
+        elif args.tasks_command == "complete":
+            payload = store.complete(_read_json_or_jsonl(args.labels), reviewer=args.reviewer)
+        elif args.tasks_command == "stats":
+            payload = store.stats()
+        elif args.tasks_command == "export":
+            labels = store.export_labels()
+            if args.out:
+                out = Path(args.out).expanduser()
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in labels), encoding="utf-8")
+                payload = {"written_to": str(out.resolve()), "labels": len(labels)}
+            else:
+                payload = {"labels": labels}
+        else:
+            raise ValueError("missing tasks subcommand")
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _emit(payload, True)
+    return 0
+
+
+def cmd_deliver(args: argparse.Namespace) -> int:
+    try:
+        if args.delivery_command == "build":
+            payload = build_delivery(
+                args.source,
+                args.destination,
+                formats=args.format or ["lerobot-v3"],
+                name=args.name,
+                version=args.version,
+                overwrite=args.overwrite,
+                quality_rules=args.rules,
+                license=args.license,
+            )
+            code = 0 if not payload.get("quality_gate") or payload["quality_gate"].get("ok") else 1
+        elif args.delivery_command == "check":
+            payload = check_delivery(args.destination, verify_hashes=not args.no_hash)
+            code = 0 if payload["ok"] else 1
+        else:
+            raise ValueError("missing deliver subcommand")
+    except (OSError, ValueError, DeliveryError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _emit(payload, True)
+    return code
+
+
+def cmd_processors(args: argparse.Namespace) -> int:
+    try:
+        loaded = [load_processor(item, replace=True) for item in (args.load or [])]
+    except (ImportError, ValueError, ProcessorError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _emit({"loaded": loaded, "processors": list_processors()}, True)
     return 0
 
 
@@ -449,6 +567,103 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="show optional dependencies, decoder limits and platform capabilities")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("pipeline", help="run and inspect persistent DAG pipelines")
+    pipe = p.add_subparsers(dest="pipeline_command", required=True)
+    c = pipe.add_parser("run", help="start a pipeline run")
+    c.add_argument("spec")
+    c.add_argument("--store", default="pipeline-runs.sqlite3")
+    c.add_argument("--var", action="append", help="template variable key=value (repeatable)")
+    c.add_argument("--input", help="shortcut for --var input=PATH")
+    c.add_argument("--allow-write", action="store_true")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_pipeline)
+    c = pipe.add_parser("status", help="show one run")
+    c.add_argument("--run", required=True)
+    c.add_argument("--store", default="pipeline-runs.sqlite3")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_pipeline)
+    c = pipe.add_parser("list", help="list recent runs")
+    c.add_argument("--store", default="pipeline-runs.sqlite3")
+    c.add_argument("--status")
+    c.add_argument("--limit", type=int, default=20)
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_pipeline)
+    c = pipe.add_parser("resume", help="resume a waiting/failed run")
+    c.add_argument("--run", required=True)
+    c.add_argument("--store", default="pipeline-runs.sqlite3")
+    c.add_argument("--node", help="human node id")
+    c.add_argument("--result", help="human node result JSON/JSONL")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_pipeline)
+    c = pipe.add_parser("stats", help="pipeline throughput/failure statistics")
+    c.add_argument("--store", default="pipeline-runs.sqlite3")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_pipeline)
+
+    p = sub.add_parser("tasks", help="human review task queue")
+    tasks = p.add_subparsers(dest="tasks_command", required=True)
+    c = tasks.add_parser("ingest", help="ingest a labeling manifest with prelabels/sampling")
+    c.add_argument("--manifest", required=True)
+    c.add_argument("--store", default="human-tasks.sqlite3")
+    c.add_argument("--prelabels", help="prelabel JSON/JSONL")
+    c.add_argument("--strategy", default="priority", choices=["priority", "uncertainty", "stratified", "first", "sequential"])
+    c.add_argument("--limit", type=int)
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_tasks)
+    c = tasks.add_parser("list", help="list queued tasks")
+    c.add_argument("--store", default="human-tasks.sqlite3")
+    c.add_argument("--status")
+    c.add_argument("--assignee")
+    c.add_argument("--limit", type=int, default=100)
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_tasks)
+    c = tasks.add_parser("assign", help="assign pending tasks")
+    c.add_argument("--store", default="human-tasks.sqlite3")
+    c.add_argument("--assignee", required=True)
+    c.add_argument("--strategy", default="priority", choices=["priority", "uncertainty", "stratified", "first", "sequential"])
+    c.add_argument("--limit", type=int, default=20)
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_tasks)
+    c = tasks.add_parser("complete", help="complete labels and update the queue")
+    c.add_argument("--store", default="human-tasks.sqlite3")
+    c.add_argument("--labels", required=True)
+    c.add_argument("--reviewer")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_tasks)
+    c = tasks.add_parser("stats", help="queue coverage/SLA statistics")
+    c.add_argument("--store", default="human-tasks.sqlite3")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_tasks)
+    c = tasks.add_parser("export", help="export reviewed labels")
+    c.add_argument("--store", default="human-tasks.sqlite3")
+    c.add_argument("--out")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_tasks)
+
+    p = sub.add_parser("deliver", help="build and verify versioned delivery packs")
+    deliver = p.add_subparsers(dest="delivery_command", required=True)
+    c = deliver.add_parser("build", help="build a delivery pack")
+    c.add_argument("source")
+    c.add_argument("destination")
+    c.add_argument("--format", action="append", choices=["jsonl", "lerobot-v2", "lerobot-v3", "zarr", "mcap-inventory"])
+    c.add_argument("--name")
+    c.add_argument("--version", default="1")
+    c.add_argument("--overwrite", action="store_true")
+    c.add_argument("--rules", help="quality gate JSON/TOML")
+    c.add_argument("--license")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_deliver)
+    c = deliver.add_parser("check", help="verify a delivery manifest")
+    c.add_argument("destination")
+    c.add_argument("--no-hash", action="store_true")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_deliver)
+
+    p = sub.add_parser("processors", help="list or load processor plugins")
+    p.add_argument("--load", action="append", help="module:function (repeatable)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_processors)
 
     p = sub.add_parser("detect", help="detect the format of a path")
     p.add_argument("path")

@@ -3,7 +3,7 @@
 安装后入口是 `embodied`；没安装时用 `PYTHONPATH=src python -m embodied_core.cli`。
 
 ```text
-embodied {doctor,formats,detect,info,validate,gate,media,quality,segment,label,review,convert,scaffold,windows,checks,catalog,storage,api} ...
+embodied {doctor,formats,detect,info,validate,gate,media,quality,segment,label,review,pipeline,tasks,deliver,processors,convert,scaffold,windows,checks,catalog,storage,api} ...
 embodied --version
 ```
 
@@ -215,3 +215,50 @@ embodied api --db catalog.db --host 127.0.0.1 --port 8000 [--token TOKEN] [--cor
 ```
 
 只读 HTTP Catalog API；`/health`、`/v1/stats`、分页 `/v1/datasets`、版本/谱系和 `/v1/runs`。端点与 ETag 细节见 [api.md](api.md)。
+
+## pipeline
+
+```bash
+embodied pipeline run pipeline.json --store runs.sqlite3 [--input DATASET] [--var key=value] [--allow-write]
+embodied pipeline status --run run_xxx --store runs.sqlite3
+embodied pipeline list --store runs.sqlite3 [--status waiting_human]
+embodied pipeline resume --run run_xxx --node review --result review.json --store runs.sqlite3
+embodied pipeline stats --store runs.sqlite3
+```
+
+节点类型：`tool`、`processor`、`human`、`noop`。工具节点支持 `depends_on`、`retries`、`continue_on_error`，参数支持 `${input}`、`${var}` 和 `${nodes.<id>.<path>}` 模板。`human` 节点会停在 `waiting_human`，resume 时传入该节点的审核结果。
+
+工具节点若调用写操作（convert/catalog_index/storage_pull/apply_annotations 等），必须显式 `--allow-write`。
+
+## tasks
+
+```bash
+embodied tasks ingest --manifest tasks.json --store tasks.sqlite3 --strategy uncertainty --limit 100
+embodied tasks list --store tasks.sqlite3 --status pending
+embodied tasks assign --store tasks.sqlite3 --assignee alice --limit 20
+embodied tasks complete --store tasks.sqlite3 --labels labels.jsonl --reviewer alice
+embodied tasks stats --store tasks.sqlite3
+embodied tasks export --store tasks.sqlite3 --out reviewed.jsonl
+```
+
+抽样策略：`priority`、`uncertainty`、`stratified`、`first`、`sequential`。预标格式为 `{task_id, label, confidence, source}`，重复 task 幂等写入。
+
+## deliver
+
+```bash
+embodied deliver build ./data/aloha ./deliveries/aloha-2026.11 \
+  --format lerobot-v3 --format zarr --format mcap-inventory \
+  --name aloha --version 2026.11 --license CC-BY-4.0 --rules rules.json
+embodied deliver check ./deliveries/aloha-2026.11 [--no-hash]
+```
+
+交付目录包含 `delivery-manifest.json`，记录源数据指纹、每格式产物、逐文件大小/SHA-256、质量门摘要和 license。`check` 逐文件验证，发现缺失、大小或哈希不符时退出码 1。
+
+## processors
+
+```bash
+embodied processors --json
+embodied processors --load my_module:my_processor --json
+```
+
+处理器协议为 `fn(arguments: dict, context: dict) -> dict`；可通过 Python 注册或 `module:function` 动态加载。

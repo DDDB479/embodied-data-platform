@@ -10,6 +10,8 @@ from typing import Any
 
 from . import __version__
 from .media import find_ffprobe
+from .pipeline import list_tool_handlers
+from .processors import list_processors
 from .registry import describe_formats
 from .ros2_codec import max_message_bytes, max_point_count, supported_message_types
 from .tfrecord import max_record_bytes
@@ -69,5 +71,24 @@ def capability_report() -> dict[str, Any]:
             "etag": True,
             "pagination": True,
         },
+        "pipeline": {
+            "persistent": True,
+            "node_types": ["tool", "processor", "human", "noop"],
+            "tools": list_tool_handlers(),
+            "human_wait_resume": True,
+            "retries": True,
+        },
+        "human_tasks": {
+            "persistent": True,
+            "sampling": ["priority", "uncertainty", "stratified", "first", "sequential"],
+            "prelabels": True,
+            "assignments": True,
+        },
+        "delivery": {
+            "formats": ["jsonl", "lerobot-v2", "lerobot-v3", "zarr", "mcap-inventory"],
+            "manifest": True,
+            "sha256_verification": True,
+        },
+        "processors": list_processors(),
         "optional_dependencies": optional,
     }

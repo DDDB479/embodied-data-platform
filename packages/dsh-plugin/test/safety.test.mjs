@@ -107,6 +107,26 @@ test('media, annotation and storage paths are normalized and guarded', () => {
   }
 });
 
+test('pipeline, task queue and delivery paths are normalized and guarded', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'embodied-v6-paths-'));
+  try {
+    const run = normalizePathArguments('pipeline_run', { spec: 'pipeline.json', store: 'runs.sqlite3' }, root);
+    assert.equal(run.spec, path.join(root, 'pipeline.json'));
+    assert.equal(run.store, path.join(root, 'runs.sqlite3'));
+    const queue = normalizePathArguments('task_queue', { action: 'ingest', store: 'tasks.sqlite3', manifest: 'tasks.json', out: 'labels.jsonl' }, root);
+    assert.equal(queue.store, path.join(root, 'tasks.sqlite3'));
+    assert.equal(queue.manifest, path.join(root, 'tasks.json'));
+    assert.equal(queue.out, path.join(root, 'labels.jsonl'));
+    const delivery = normalizePathArguments('delivery', { action: 'build', source: 'dataset', destination: 'out' }, root);
+    assert.equal(delivery.destination, path.join(root, 'out'));
+    assert.deepEqual(writeTargets('pipeline_run', { store: 'runs.sqlite3' }).length, 1);
+    assert.deepEqual(writeTargets('task_queue', { store: 'tasks.sqlite3', out: 'labels.jsonl' }).length, 2);
+    assert.deepEqual(writeTargets('delivery', { destination: 'out' }).length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('write targets are explicit and ignore an absent optional out', () => {
   assert.deepEqual(writeTargets('convert_dataset', { destination: 'out' }).length, 1);
   assert.deepEqual(writeTargets('labeling_tasks', {}), []);

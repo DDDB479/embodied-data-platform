@@ -7,11 +7,12 @@ and are detected at import time, so the same code runs inside a DSH plugin, a
 bare MCP server, or a CI container with a trimmed dependency set.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from .annotations import apply_annotation_feedback, review_annotations
 from .cache import QualityCache, dataset_fingerprint, default_quality_cache_path
-from .convert import compute_normalization_stats, convert, to_lerobot_v3
+from .convert import compute_normalization_stats, convert, to_lerobot_v3, to_zarr
+from .delivery import build_delivery, check_delivery
 from .formats.base import (
     DatasetObject,
     Detection,
@@ -24,12 +25,15 @@ from .gate import DEFAULT_RULES, evaluate_quality_gate, load_quality_rules
 from .jobs import JobCancelled, JobManager, JobNotFound
 from .media import probe_dataset_media, probe_video
 from .platform import capability_report
+from .pipeline import PipelineStore, resume_pipeline, run_pipeline, validate_pipeline
+from .processors import get_processor, list_processors, load_processor, register_processor, run_processor
 from .model import DatasetSummary, EpisodeRecord, FeatureSpec, Issue, Severity, summarize_issues, to_jsonable
 from .registry import UnsupportedFormat, describe_formats, detect_dataset, open_dataset
 from .reports import quality_report
 from .ros2_codec import decode_message, supported_message_types
 from .storage import parse_storage_uri, pull
 from .tfrecord import decode_rlds_record, iter_tfrecords
+from .task_queue import TaskQueueStore, sample_tasks
 from .validate import CHECKS, DEFAULT_CHECKS, validate
 
 __all__ = [
@@ -53,6 +57,8 @@ __all__ = [
     "Severity",
     "UnsupportedFormat",
     "apply_annotation_feedback",
+    "build_delivery",
+    "check_delivery",
     "compute_normalization_stats",
     "capability_report",
     "convert",
@@ -62,19 +68,31 @@ __all__ = [
     "default_quality_cache_path",
     "decode_message",
     "decode_rlds_record",
+    "get_processor",
     "collect_frame_chunks",
     "evaluate_quality_gate",
     "load_quality_rules",
+    "list_processors",
+    "load_processor",
     "open_dataset",
     "parse_storage_uri",
+    "PipelineStore",
     "probe_dataset_media",
     "probe_video",
     "pull",
     "quality_report",
     "review_annotations",
+    "register_processor",
+    "resume_pipeline",
+    "run_pipeline",
+    "run_processor",
+    "sample_tasks",
     "supported_message_types",
     "iter_tfrecords",
     "to_lerobot_v3",
+    "to_zarr",
+    "TaskQueueStore",
+    "validate_pipeline",
     "summarize_issues",
     "to_jsonable",
     "validate",

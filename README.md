@@ -7,7 +7,7 @@
 | Python 库 | `import embodied_core` | 平台后端、离线脚本、CI |
 | 命令行 | `embodied <command>` | 终端里的快速巡检、流水线步骤 |
 | MCP 服务 | `embodied-mcp`（stdio） | Codex、Claude Code、DeepSeek、Cursor 等任意支持 MCP 的模型/客户端 |
-| DSH 插件 | `dsh-embodied-data` | DeepSeek Harness，把上面 23 个 MCP 工具注册成原生 agent 工具 |
+| DSH 插件 | `dsh-embodied-data` | DeepSeek Harness，把上面 27 个 MCP 工具注册成原生 agent 工具 |
 
 核心逻辑只有一份 Python 实现，模型侧无论走 MCP 还是 DSH 插件，用的都是同一套行为，不会出现"Codex 里能跑、DeepSeek 里报错"的分裂。
 
@@ -88,6 +88,8 @@ print(report["score"], [i["code"] for i in report["issues"]])
 
 **v0.5 稳定性**：CDR/TFRecord/点云均有消息、记录和点数上限；导出和标注写入原子化；解码器未知类型显式失败；`embodied doctor` 汇总依赖、解码器、资源上限和平台能力。
 
+**v0.6 生产编排**：持久化 DAG 流水线（tool/processor/human/noop 节点、重试、人工等待与恢复）、人工任务队列（预标、置信度、uncertainty/stratified 抽样、分配、SLA）、处理器插件协议、版本化交付包（逐文件 SHA-256、质量门证据）和 Zarr v2 导出。
+
 **脚手架**（`scaffold_project`）：`platform`（平台骨架 + 数据契约 + 质量门）/ `adapter`（新格式适配器 + 测试）/ `pipeline`（摄取流水线 + 测试），生成的文件都带类型标注，可直接跑。
 
 ## 文档
@@ -97,12 +99,12 @@ print(report["score"], [i["code"] for i in report["issues"]])
 | [docs/features.md](docs/features.md) | 插件功能总览、工具清单、工作流与验证状态 |
 | [docs/getting-started.md](docs/getting-started.md) | 安装、第一个数据集、常见工作流 |
 | [docs/formats.md](docs/formats.md) | 支持矩阵、每种格式的探测依据、如何新增适配器 |
-| [docs/mcp.md](docs/mcp.md) | 23 个 MCP 工具的参数与返回结构 |
+| [docs/mcp.md](docs/mcp.md) | 27 个 MCP 工具的参数与返回结构 |
 | [docs/cli.md](docs/cli.md) | 命令、退出码、JSON 输出形态 |
 | [docs/models.md](docs/models.md) | Codex / Claude Code / DeepSeek / Cursor / DSH 的接入配置 |
 | [docs/plugin.md](docs/plugin.md) | DSH 插件安装、配置项、自检 |
 | [docs/api.md](docs/api.md) | HTTP Catalog API、对象存储与平台诊断 |
-| [docs/roadmap.md](docs/roadmap.md) | v0.4 平台化与 v0.5 稳定性范围 |
+| [docs/roadmap.md](docs/roadmap.md) | v0.4–v0.6 平台化、稳定性与生产编排范围 |
 | [packages/dsh-plugin/README.md](packages/dsh-plugin/README.md) | 插件包说明 |
 
 ## 目录结构
@@ -124,13 +126,17 @@ D:\具身平台插件开发\
 │   ├── storage.py              # file/http(s)/s3 原子拉取与校验
 │   ├── api.py                  # 只读 HTTP Catalog API
 │   ├── platform.py             # 依赖/能力/资源上限诊断
+│   ├── pipeline.py             # 持久化 DAG、人工等待、重试与统计
+│   ├── task_queue.py           # 人工任务、预标、抽样与分配
+│   ├── processors.py           # 处理器插件协议
+│   ├── delivery.py             # 版本化交付包与哈希校验
 │   ├── convert.py              # JSONL / LeRobot 目标格式
 │   ├── catalog.py              # schema v2：数据集/版本/运行/谱系
 │   ├── scaffold.py             # 项目模板
 │   ├── cli.py                  # embodied 命令
 │   └── mcp_server.py           # 零依赖 MCP stdio 服务
 ├── packages/dsh-plugin/        # 零依赖 ESM 插件（JS 只做 MCP 桥接）
-├── tests/                      # unittest（pytest 兼容），169 项
+├── tests/                      # unittest（pytest 兼容），181 项
 ├── tools/                      # 夹具生成 + 端到端脚本
 ├── examples/                   # 可直接运行的示例
 └── docs/
@@ -139,10 +145,10 @@ D:\具身平台插件开发\
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -t .     # 169 项单元测试，或用 pytest
-python tools/e2e.py                           # 21 项端到端（需先 tools/make_fixtures.py 生成夹具）
+python -m unittest discover -s tests -t .     # 181 项单元测试，或用 pytest
+python tools/e2e.py                           # 22 项端到端（需先 tools/make_fixtures.py 生成夹具）
 node packages/dsh-plugin/scripts/probe.mjs    # 插件自检（mock cordis ctx）
-node --test packages/dsh-plugin/test/*.test.mjs  # 16 项插件单测（路径/并发/审批）
+node --test packages/dsh-plugin/test/*.test.mjs  # 17 项插件单测（路径/并发/审批）
 node tools/check_clean_install.mjs --python /abs/path/to/python  # 打包后临时安装并探测
 ```
 
@@ -152,8 +158,8 @@ Python 依赖全部可选：核心只需要 `numpy`；parquet 要 `pyarrow`，HD
 
 ## 状态
 
-- 核心库、CLI、MCP、DSH 插件均已跑通（169 项 Python 单测 + 16 项插件单测 + 21 项端到端 + 插件 probe + 干净安装）。
-- 插件已装进本机 profile（`~/.dsh/profiles/desktop`）并在 Harness 会话里实测：24 个 `embodied_*` 工具可用，live 调用 detect / summarize / quality 返回真实数据。
+- 核心库、CLI、MCP、DSH 插件均已跑通（181 项 Python 单测 + 17 项插件单测 + 22 项端到端 + 插件 probe + 干净安装）。
+- 插件已装进本机 profile（`~/.dsh/profiles/desktop`）并在 Harness 会话里实测：28 个 `embodied_*` 工具可用，live 调用 detect / summarize / quality 返回真实数据。
 - `quality_report` 默认写用户缓存目录；可用 `embodied cache stats|clear` 查看或清理，不占用数据集目录。
 - `iter_frames()` 在 JSONL、LeRobot parquet 和 HDF5 上按块产出 `FrameChunk`；`frames()` 仍保留，但受 `max_frames` 保护，避免误把海量数据一次性读入内存。
 - 编目库会自动把旧 v1 数据库迁移到 schema v2；重复索引未变化的文件只记一次 run，不产生新版本。

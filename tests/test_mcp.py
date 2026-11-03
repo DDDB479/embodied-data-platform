@@ -48,7 +48,7 @@ class McpProtocolTestCase(unittest.TestCase):
 
     def test_tools_list_shape(self) -> None:
         result = _rpc("tools/list")["result"]
-        self.assertEqual(len(result["tools"]), 23)
+        self.assertEqual(len(result["tools"]), 27)
         for tool in result["tools"]:
             self.assertIn("name", tool)
             self.assertIn("description", tool)
@@ -57,7 +57,7 @@ class McpProtocolTestCase(unittest.TestCase):
                 set(tool["annotations"]),
                 {"readOnlyHint", "destructiveHint", "openWorldHint"},
             )
-            self.assertIs(tool["annotations"]["openWorldHint"], tool["name"] == "storage_pull")
+            self.assertIs(tool["annotations"]["openWorldHint"], tool["name"] in {"storage_pull", "pipeline_run"})
         by_name = {tool["name"]: tool for tool in result["tools"]}
         self.assertTrue(by_name["list_formats"]["annotations"]["readOnlyHint"])
         self.assertFalse(by_name["convert_dataset"]["annotations"]["readOnlyHint"])
@@ -69,6 +69,10 @@ class McpProtocolTestCase(unittest.TestCase):
         self.assertIn("decode_samples", by_name)
         self.assertIn("apply_annotations", by_name)
         self.assertIn("storage_pull", by_name)
+        self.assertIn("pipeline_run", by_name)
+        self.assertIn("pipeline_status", by_name)
+        self.assertIn("task_queue", by_name)
+        self.assertIn("delivery", by_name)
 
     def test_unknown_method_is_an_error(self) -> None:
         response = _rpc("does/not/exist")
@@ -201,6 +205,49 @@ class McpToolTestCase(unittest.TestCase):
         failed, pulled = _call("storage_pull", {"uri": str(source), "destination": str(self.root / "pulled")})
         self.assertFalse(failed)
         self.assertEqual(pulled["files"], 1)
+
+    def test_pipeline_task_queue_and_delivery_tools(self) -> None:
+        store = self.root / "pipeline-runs.sqlite3"
+        failed, run = _call(
+            "pipeline_run",
+            {
+                "spec": {"name": "noop", "nodes": [{"id": "noop", "type": "noop"}]},
+                "store": str(store),
+            },
+        )
+        self.assertFalse(failed)
+        self.assertEqual(run["status"], "succeeded", run)
+        failed, status = _call("pipeline_status", {"store": str(store), "run_id": run["run_id"]})
+        self.assertFalse(failed)
+        self.assertEqual(status["status"], "succeeded")
+
+        task_store = self.root / "tasks.sqlite3"
+        manifest = {
+            "schema_version": 1,
+            "manifest_id": "lm_mcp",
+            "dataset": {"path": str(self.dataset)},
+            "tasks": [{"task_id": "task_1", "episode": 0, "start_frame": 0, "end_frame": 2, "question": "ok?"}],
+        }
+        failed, queued = _call("task_queue", {"action": "ingest", "store": str(task_store), "manifest": manifest})
+        self.assertFalse(failed)
+        self.assertEqual(queued["inserted"], 1)
+        failed, assigned = _call("task_queue", {"action": "assign", "store": str(task_store), "assignee": "alice"})
+        self.assertFalse(failed)
+        self.assertEqual(assigned["assigned"], 1)
+        failed, completed = _call("task_queue", {"action": "complete", "store": str(task_store), "labels": [{"task_id": "task_1", "answer": "valid"}]})
+        self.assertFalse(failed)
+        self.assertEqual(completed["updated"], 1)
+
+        delivery = self.root / "delivery"
+        failed, built = _call(
+            "delivery",
+            {"action": "build", "source": str(self.dataset), "destination": str(delivery), "formats": ["jsonl"]},
+        )
+        self.assertFalse(failed)
+        self.assertEqual(built["formats"], ["jsonl"])
+        failed, checked = _call("delivery", {"action": "check", "destination": str(delivery)})
+        self.assertFalse(failed)
+        self.assertTrue(checked["ok"], checked)
 
     def test_catalog_round_trip(self) -> None:
         db = self.root / "catalog.db"

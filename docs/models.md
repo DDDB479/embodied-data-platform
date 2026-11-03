@@ -95,7 +95,7 @@ Claude Code 的 MCP 服务器可以随项目提交（`.mcp.json`），团队共�
 
 DeepSeek 的模型 API 本身不托管 MCP；接法是**经由支持 MCP 的客户端**。两条路：
 
-1. **DeepSeek Harness（本仓库自带插件）** —— 见 [plugin.md](plugin.md)。插件把 23 个 MCP 工具注册成原生 agent 工具，并且注入一段工作流提示词，模型不需要先"发现"工具就知道该怎么用。
+1. **DeepSeek Harness（本仓库自带插件）** —— 见 [plugin.md](plugin.md)。插件把 27 个 MCP 工具注册成原生 agent 工具，并且注入一段工作流提示词，模型不需要先"发现"工具就知道该怎么用。
 2. **任何支持自定义 MCP 的 DeepSeek 客户端**（Cherry Studio、Cline、Roo Code 等）—— 用上面的通用 JSON 片段即可。
 
 一个实际可用的提示词（也放在 `examples/agent_prompt.md`）：

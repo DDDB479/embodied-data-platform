@@ -40,7 +40,7 @@ class MediaTestCase(unittest.TestCase):
 
     def test_capability_report_covers_decoders_and_limits(self) -> None:
         report = capability_report()
-        self.assertEqual(report["version"], "0.5.0")
+        self.assertEqual(report["version"], "0.6.0")
         self.assertIn("sensor_msgs/JointState", report["ros2_cdr"]["message_types"])
         self.assertGreater(report["ros2_cdr"]["max_message_bytes"], 0)
         self.assertTrue(report["rlds"]["light_decoder"])
